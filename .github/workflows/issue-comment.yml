@@ -1,0 +1,22 @@
+name: Issue Comment Handler
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  handle:
+    runs-on: self-hosted
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - name: Process comment
+        env:
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          echo "New comment from ${{ github.event.comment.user.login }}"
+          echo "Comment: ${{ github.event.comment.body }}"
+          echo "Issue: ${{ github.event.issue.title }}"
